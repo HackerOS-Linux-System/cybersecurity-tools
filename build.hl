@@ -1,4 +1,5 @@
 || H#
 
 > cd source-code
-> vira build --release
+> cd eiq && bytes build --release && cd ..
+
