@@ -1,5 +1,3 @@
 || H#
 
-> cd source-code
-> cd eiq && bytes build --release && cd ..
-
+> bytes build --release
