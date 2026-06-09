@@ -1,164 +1,246 @@
-;; eiq_tool.h# — H# 2026 edition
-;; Rewrite of the Odin CLI tool for file encryption/decryption
 using "2026"
-
-use "std -> env"  from "env"
-use "std -> fs"   from "fs"
-use "std -> os"   from "os"
-use "std -> crypto" from "crypto"
+;; chker.h# — H# rewrite of the Odin kernel installer
+;; Commands: liquorix, xanmod, deb-kernel
 
 fn print_help() is
-    write("Usage: eiq <command> [options]")
-    write("")
+    write("Usage: chker <command>")
     write("Commands:")
-    write("  up          Bring up the service (requires root)")
-    write("  down        Bring down the service (requires root)")
-    write("  daemon      Run as daemon (requires root)")
-    write("  encrypt     Encrypt a file")
-    write("    <file>              Input file")
-    write("    -o <file>          Output file (default: input.eiq)")
-    write("    -p <password>      Password (required)")
-    write("  decrypt     Decrypt a file")
-    write("    <file>              Input file")
-    write("    -o <file>          Output file (required)")
-    write("    -p <password>      Password (required)")
+    write("  liquorix    - Install Liquorix kernel, remove Debian kernel")
+    write("  xanmod      - Install XanMod kernel, remove Debian kernel")
+    write("  deb-kernel  - Install Debian kernel, remove current custom kernel")
 end
 
-fn cmd_up() is
-    write("Executing up command")
-    ;; TODO: start service
+fn run_cmd(cmd: string) -> string is
+    return trim(shell(cmd))
 end
 
-fn cmd_down() is
-    write("Executing down command")
-    ;; TODO: stop service
+fn sudo_run(cmd: string) is
+    shell("sudo " + cmd)
 end
 
-fn cmd_daemon() is
-    write("Executing daemon command")
-    ;; TODO: daemonize process
+fn command_exists(cmd: string) -> bool is
+    let r: string = trim(shell("command -v " + cmd + " 2>/dev/null"))
+    return r != ""
 end
 
-fn encrypt_file(input: string, output: string, password: string) is
-    write("Encrypting ${input} → ${output}")
-    ;; Read input
-    let data: string = fs_read(input)
-    if data == "" is
-        write("Error: cannot read file: " + input)
-        return
+fn get_cpu_model() -> string is
+    return trim(shell("grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs"))
+end
+
+fn get_cpu_vendor() -> string is
+    return trim(shell("grep 'vendor_id' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs"))
+end
+
+fn get_cpu_text() -> string is
+    let model: string  = to_lower(get_cpu_model())
+    let vendor: string = to_lower(get_cpu_vendor())
+    let lscpu: string  = to_lower(trim(shell("lscpu 2>/dev/null")))
+    return model + " " + vendor + " " + lscpu
+end
+
+fn get_current_kernel() -> string is
+    return trim(shell("uname -r"))
+end
+
+fn get_home() -> string is
+    return trim(shell("echo $HOME"))
+end
+
+fn parse_mappings(file: string) -> string is
+    ;; Returns newline-separated "pattern>target" lines
+    ;; Uses a Python helper to avoid shell quoting complexity
+    let script: string = "python3 -c \"import re,sys; txt=open(sys.argv[1]).read(); [print(m) for m in re.findall(r'[A-Za-z0-9_. -]+>[A-Za-z0-9_-]+', txt)]\" " + file + " 2>/dev/null"
+    return trim(shell(script))
+end
+
+fn match_cpu_variant(cpu_text: string, mappings: string) -> string is
+    ;; Write mappings to a temp file, then use a Python one-liner to match
+    let tmp: string = "/tmp/hsharp_mappings_tmp.txt"
+    fs_write(tmp, mappings)
+    let script: string = "python3 -c \""
+        + "import sys; lines=open('" + tmp + "').read().splitlines(); "
+        + "cpu='" + cpu_text + "'.lower(); "
+        + "pairs=[(l.split('>')[0].strip().lower(),l.split('>')[1].strip()) for l in lines if '>' in l]; "
+        + "pairs.sort(key=lambda x: -len(x[0])); "
+        + "result=[t for p,t in pairs if p in cpu]; "
+        + "print(result[0] if result else 'x86-64')"
+        + "\""
+    let matched: string = trim(shell(script))
+    if matched == "" is
+        return "x86-64"
     end
-    ;; XOR-based encryption (placeholder — swap for AES in production)
-    let key_hash: string = sha256(password)
-    let encrypted: string = shell("echo " + data + " | openssl enc -aes-256-cbc -pass pass:" + password + " -base64 2>/dev/null")
-    if encrypted == "" is
-        ;; Fallback: simple XOR via shell
-        let enc: string = shell("echo '" + data + "' | openssl enc -base64 -pass pass:" + password + " 2>/dev/null || echo '[encrypted]'")
-        fs_write(output, enc)
+    return matched
+end
+
+fn get_xanmod_variant(target: string) -> string is
+    let v: string = "x64v1"
+    if contains(target, "v3") is
+        v = "x64v3"
+    elsif contains(target, "v2") is
+        v = "x64v2"
+    end
+    return v
+end
+
+fn check_and_install_nvidia(prefix: string) is
+    write(prefix + " Sprawdzam NVIDIA...")
+    if command_exists("lspci") == false is
+        sudo_run("apt install -y pciutils")
+    end
+    let lspci: string = to_lower(trim(shell("lspci -nnk 2>/dev/null")))
+    if contains(lspci, "nvidia") is
+        write(prefix + " Wykryto NVIDIA - instaluje sterowniki.")
+        sudo_run("apt update")
+        sudo_run("apt install -y nvidia-driver nvidia-kernel-dkms nvidia-smi libnvidia-ml1 nvidia-settings")
     else is
-        fs_write(output, encrypted)
+        write(prefix + " Nie wykryto NVIDIA.")
     end
-    write("Done: " + output)
 end
 
-fn decrypt_file(input: string, output: string, password: string) is
-    write("Decrypting ${input} → ${output}")
-    let data: string = fs_read(input)
-    if data == "" is
-        write("Error: cannot read file: " + input)
+fn remove_debian_kernel(prefix: string) is
+    let script: string = "/usr/share/HackerOS/Scripts/Bin/remove-debian-kernel.sh"
+    let exists: string = trim(shell("test -f " + script + " && echo yes || echo no"))
+    if exists == "yes" is
+        write(prefix + " Uruchamiam skrypt usuwajacy stare jadra: " + script)
+        sudo_run(script)
+    else is
+        write(prefix + " Skrypt nie istnieje: " + script + " - usuwam biezace jadro.")
+        let uname: string = get_current_kernel()
+        sudo_run("apt remove --purge -y linux-image-" + uname)
+    end
+end
+
+fn create_config_file(kernel_type: string) is
+    let home: string       = get_home()
+    let config_dir: string = home + "/.config/hackeros"
+    shell("mkdir -p " + config_dir)
+    fs_write(config_dir + "/kernel.hacker", "[" + kernel_type + "]\n")
+end
+
+fn add_xanmod_repo(prefix: string) is
+    write(prefix + " Dodaje repozytorium xanmod...")
+    sudo_run("mkdir -p /etc/apt/keyrings")
+    if command_exists("wget") == false is
+        sudo_run("apt update")
+        sudo_run("apt install -y wget")
+    end
+    shell("wget -qO /tmp/xanmod.key https://dl.xanmod.org/archive.key")
+    sudo_run("gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg /tmp/xanmod.key")
+    let release: string = trim(shell("lsb_release -sc 2>/dev/null || echo bookworm"))
+    let list_content: string = "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org " + release + " main"
+    fs_write("/tmp/xanmod-release.list", list_content)
+    sudo_run("cp /tmp/xanmod-release.list /etc/apt/sources.list.d/xanmod-release.list")
+    sudo_run("apt update")
+end
+
+fn install_xanmod() is
+    let prefix: string = "[xanmod-installer]"
+    write(prefix + " Start")
+    let tmpfile: string    = "/tmp/xanmod-cpu.hacker"
+    let github_raw: string = "https://raw.githubusercontent.com/HackerOS-Linux-System/Hacker-Lang/main/hacker-packages/xanmod-cpu.hacker"
+    write(prefix + " Pobieram plik z GitHub: " + github_raw)
+    if command_exists("curl") == false is
+        sudo_run("apt update")
+        sudo_run("apt install -y curl")
+    end
+    let dl: string = trim(shell("curl -fsSL -o " + tmpfile + " " + github_raw + " 2>&1 && echo ok || echo fail"))
+    if dl != "ok" is
+        write(prefix + " Blad pobierania pliku z GitHub.")
         return
     end
-    let decrypted: string = shell("echo '" + data + "' | openssl enc -d -aes-256-cbc -pass pass:" + password + " -base64 2>/dev/null")
-    if decrypted == "" is
-        write("Error: decryption failed (wrong password?)")
+    write(prefix + " Plik pobrany.")
+    let mappings: string       = parse_mappings(tmpfile)
+    let cpu_text: string       = get_cpu_text()
+    write(prefix + " Wykryty CPU: " + get_cpu_model())
+    let selected_target: string = match_cpu_variant(cpu_text, mappings)
+    write(prefix + " Dopasowano target: " + selected_target)
+    let variant: string = get_xanmod_variant(selected_target)
+    write(prefix + " Wybrana wersja xanmod: " + variant)
+    add_xanmod_repo(prefix)
+    let pkg: string = "linux-xanmod-lts-" + variant
+    write(prefix + " Instaluje: " + pkg)
+    sudo_run("apt install -y " + pkg)
+    write(prefix + " Instalacja kernela xanmod zakonczona.")
+    check_and_install_nvidia(prefix)
+    remove_debian_kernel(prefix)
+    create_config_file("xanmod")
+    sudo_run("update-grub")
+    write(prefix + " GOTOWE. Zrestartuj system.")
+end
+
+fn install_liquorix() is
+    let prefix: string = "[liquorix-installer]"
+    write(prefix + " Start")
+    let tmpfile: string    = "/tmp/xanmod-cpu.hacker"
+    let github_raw: string = "https://raw.githubusercontent.com/HackerOS-Linux-System/Hacker-Lang/main/hacker-packages/xanmod-cpu.hacker"
+    if command_exists("curl") == false is
+        sudo_run("apt update")
+        sudo_run("apt install -y curl")
+    end
+    let dl: string = trim(shell("curl -fsSL -o " + tmpfile + " " + github_raw + " 2>&1 && echo ok || echo fail"))
+    if dl != "ok" is
+        write(prefix + " Blad pobierania pliku z GitHub.")
         return
     end
-    fs_write(output, decrypted)
-    write("Done: " + output)
+    write(prefix + " Plik pobrany.")
+    let mappings: string        = parse_mappings(tmpfile)
+    let cpu_text: string        = get_cpu_text()
+    write(prefix + " Wykryty CPU: " + get_cpu_model())
+    let selected_target: string = match_cpu_variant(cpu_text, mappings)
+    write(prefix + " Dopasowano target: " + selected_target)
+    write(prefix + " Instaluje jadro Liquorix...")
+    let liquorix_url: string = "https://liquorix.net/install-liquorix.sh"
+    shell("curl -s " + liquorix_url + " -o /tmp/install-liquorix.sh")
+    sudo_run("bash /tmp/install-liquorix.sh")
+    write(prefix + " Jadro Liquorix zainstalowane.")
+    check_and_install_nvidia(prefix)
+    remove_debian_kernel(prefix)
+    create_config_file("liquorix")
+    write(prefix + " GOTOWE. Zrestartuj system.")
 end
 
-fn parse_flags(args: string, flag: string) -> string is
-    ;; Parse -flag value or --flag value from args string
-    let parts: string = shell("echo '" + args + "' | grep -oP '(?<=-" + flag + " )\\S+'")
-    return trim(parts)
+fn install_deb_kernel() is
+    let prefix: string  = "[deb-kernel-installer]"
+    let current: string = get_current_kernel()
+    let has_liquorix: bool = contains(current, "liquorix")
+    let has_xanmod: bool   = contains(current, "xanmod")
+    if has_liquorix == false && has_xanmod == false is
+        write(prefix + " Jadro Debiana jest juz aktywne. Nic nie robie.")
+        return
+    end
+    write(prefix + " Usuwam aktualne jadro i instaluje debianowe.")
+    sudo_run("apt remove --purge -y linux-image-" + current)
+    sudo_run("apt update")
+    sudo_run("apt install -y linux-image-amd64")
+    sudo_run("update-grub")
+    let home: string        = get_home()
+    let config_file: string = home + "/.config/hackeros/kernel.hacker"
+    shell("rm -f " + config_file)
+    write(prefix + " GOTOWE. Zrestartuj system.")
 end
 
-fn is_root() -> bool is
-    let uid: string = trim(shell("id -u"))
-    return uid == "0"
+fn get_argv1() -> string is
+    ;; Read first CLI argument via shell — works in interpreter and compiled mode
+    return trim(shell("echo ${CHKER_CMD:-}"))
 end
 
 fn main() is
-    let args: string = trim(shell("echo $@"))
-    let argc: int    = to_int(trim(shell("echo $#")))
-
-    ;; Get command from first arg
-    let cmd: string = trim(shell("echo ${1:-}"))
-
+    ;; In H# v0.7 we use env var CHKER_CMD to pass command
+    ;; Usage: CHKER_CMD=liquorix ./chker
+    ;; Or via wrapper script that sets CHKER_CMD from $1
+    let cmd: string = get_argv1()
     if cmd == "" is
         print_help()
         return
     end
-
-    ;; Commands requiring root
-    let need_root: bool = cmd == "up" || cmd == "down" || cmd == "daemon"
-    if need_root is
-        if is_root() == false is
-            write("[-] Needs root for up/down/daemon")
-            return
-        end
-    end
-
-    ;; Dispatch
-    if cmd == "up" is
-        cmd_up()
-    else if cmd == "down" is
-        cmd_down()
-    else if cmd == "daemon" is
-        cmd_daemon()
-    else if cmd == "encrypt" is
-        ;; Parse args: eiq_tool encrypt <file> -p <pass> [-o <out>]
-        let file:     string = trim(shell("echo ${2:-}"))
-        let password: string = trim(shell("echo $( echo \"$*\" | grep -oP '(?<=-p )\\S+' | head -1 )"))
-        let out:      string = trim(shell("echo $( echo \"$*\" | grep -oP '(?<=-o )\\S+' | head -1 )"))
-
-        if file == "" is
-            write("Error: input file required")
-            print_help()
-            return
-        end
-        if password == "" is
-            write("Error: password required (-p)")
-            print_help()
-            return
-        end
-        if out == "" is
-            out = file + ".eiq"
-        end
-        encrypt_file(file, out, password)
-
-    else if cmd == "decrypt" is
-        let file:     string = trim(shell("echo ${2:-}"))
-        let password: string = trim(shell("echo $( echo \"$*\" | grep -oP '(?<=-p )\\S+' | head -1 )"))
-        let out:      string = trim(shell("echo $( echo \"$*\" | grep -oP '(?<=-o )\\S+' | head -1 )"))
-
-        if file == "" is
-            write("Error: input file required")
-            print_help()
-            return
-        end
-        if password == "" is
-            write("Error: password required (-p)")
-            print_help()
-            return
-        end
-        if out == "" is
-            write("Error: output file required (-o)")
-            print_help()
-            return
-        end
-        decrypt_file(file, out, password)
+    if cmd == "liquorix" is
+        install_liquorix()
+    elsif cmd == "xanmod" is
+        install_xanmod()
+    elsif cmd == "deb-kernel" is
+        install_deb_kernel()
     else is
-        write("Unknown command: " + cmd)
+        write("Nieznane polecenie: " + cmd)
         print_help()
     end
 end
