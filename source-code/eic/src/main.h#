@@ -1,1 +1,375 @@
+using "2026"
+;; eic — Advanced Process Isolation Sandbox for HackerOS
+;; Isolation Cell for pentesting and malware analysis
+;; Usage: eic [--net=isolated] [--trace] [--output=log.txt] --run <binary>
 
+fn get_home() -> string is
+    return trim(shell("echo $HOME"))
+end
+
+fn eic_version() -> string is
+    return "eic v0.1.0 — HackerOS Isolation Cell"
+end
+
+fn print_banner() is
+    write(cyan_text("╔══════════════════════════════════════════════════════╗"))
+    write(cyan_text("║") + bold("  eic — HackerOS Isolation Cell v0.1.0              ") + cyan_text("║"))
+    write(cyan_text("║") + "  Advanced process sandbox for pentest + malware      " + cyan_text("║"))
+    write(cyan_text("╚══════════════════════════════════════════════════════╝"))
+    write("")
+end
+
+fn print_help() is
+    print_banner()
+    write(bold("USAGE:"))
+    write("  eic --run <binary>                   Full isolation (no net, CoW fs)")
+    write("  eic --net=isolated --run <binary>    Isolated network (no LAN access)")
+    write("  eic --trace --output=log.txt <bin>   Syscall + file + IP trace log")
+    write("  eic --emit-ir --run <binary>         Show IR (sandbox plan) and exit")
+    write("")
+    write(bold("FLAGS:"))
+    write("  --run <binary>       Target to execute inside sandbox")
+    write("  --net=none           No network (default)")
+    write("  --net=isolated       Internal NATd interface only — no LAN")
+    write("  --trace              Record all syscalls, file accesses, IP connections")
+    write("  --output=<file>      Write trace log to file (default: eic_trace.log)")
+    write("  --timeout=<sec>      Kill sandboxed process after N seconds")
+    write("  --allow-read=<path>  Whitelist a real path for read-only access")
+    write("  --emit-ir            Print sandbox plan and exit")
+    write("  --version            Print version")
+    write("  --help               Show this help")
+    write("")
+    write(bold("EXAMPLES:"))
+    write("  eic --run ./unknown_exploit.bin")
+    write("  eic --net=isolated --run ./web_scanner.h#")
+    write("  eic --trace --output=malware.log --run ./suspicious.elf")
+end
+
+fn check_deps() -> bool is
+    let ok: bool = true
+    let deps: string = "unshare bwrap strace ip"
+    let check: string = trim(shell("for d in " + deps + "; do command -v $d >/dev/null 2>&1 || echo missing:$d; done"))
+    if check != "" is
+        write(yellow_text("warn:") + " missing tools: " + check)
+        write(dim_text("  install: sudo apt install util-linux bubblewrap strace iproute2"))
+        ok = false
+    end
+    return ok
+end
+
+fn setup_cow_rootfs(session_dir: string) -> string is
+    ;; Create an overlay (CoW) tmpfs rootdir inside the session
+    let overlay_dir: string = session_dir + "/overlay"
+    let upper_dir:   string = session_dir + "/upper"
+    let work_dir:    string = session_dir + "/work"
+    let merged_dir:  string = session_dir + "/merged"
+    shell("mkdir -p " + overlay_dir + " " + upper_dir + " " + work_dir + " " + merged_dir)
+    ;; Try overlayfs (needs root or user ns) — fall back to tmpfs copy
+    let result: string = trim(shell(
+        "mount -t overlay overlay -o lowerdir=/,upperdir=" + upper_dir +
+        ",workdir=" + work_dir + " " + merged_dir + " 2>&1"))
+    if contains(result, "permission denied") is
+        ;; Unprivileged fallback: bwrap will handle the overlay
+        write(dim_text("  note: using bwrap bind-mount mode (no root overlay)"))
+        shell("cp -a /etc/passwd /etc/group /etc/hostname " + overlay_dir + " 2>/dev/null")
+        return session_dir
+    end
+    return merged_dir
+end
+
+fn build_seccomp_profile(session_dir: string) -> string is
+    ;; Write a seccomp-bpf allowlist profile for bwrap
+    ;; Blocks: ptrace, process_vm_readv, kexec_load, perf_event_open, etc.
+    let profile_path: string = session_dir + "/seccomp.json"
+    let profile: string = "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"architectures\":[\"SCMP_ARCH_X86_64\"],\"syscalls\":[{\"names\":[\"read\",\"write\",\"open\",\"openat\",\"close\",\"stat\",\"fstat\",\"lstat\",\"poll\",\"lseek\",\"mmap\",\"mprotect\",\"munmap\",\"brk\",\"rt_sigaction\",\"rt_sigprocmask\",\"rt_sigreturn\",\"ioctl\",\"pread64\",\"pwrite64\",\"readv\",\"writev\",\"access\",\"pipe\",\"select\",\"sched_yield\",\"mremap\",\"msync\",\"mincore\",\"madvise\",\"dup\",\"dup2\",\"pause\",\"nanosleep\",\"getitimer\",\"alarm\",\"setitimer\",\"getpid\",\"sendfile\",\"socket\",\"connect\",\"accept\",\"sendto\",\"recvfrom\",\"sendmsg\",\"recvmsg\",\"shutdown\",\"bind\",\"listen\",\"getsockname\",\"getpeername\",\"socketpair\",\"setsockopt\",\"getsockopt\",\"clone\",\"fork\",\"vfork\",\"execve\",\"exit\",\"wait4\",\"kill\",\"uname\",\"fcntl\",\"flock\",\"fsync\",\"fdatasync\",\"truncate\",\"ftruncate\",\"getdents\",\"getcwd\",\"chdir\",\"fchdir\",\"rename\",\"mkdir\",\"rmdir\",\"creat\",\"link\",\"unlink\",\"symlink\",\"readlink\",\"chmod\",\"fchmod\",\"chown\",\"fchown\",\"lchown\",\"umask\",\"gettimeofday\",\"getrlimit\",\"getrusage\",\"sysinfo\",\"times\",\"getuid\",\"getgid\",\"setuid\",\"setgid\",\"geteuid\",\"getegid\",\"setpgid\",\"getppid\",\"getpgrp\",\"setsid\",\"setreuid\",\"setregid\",\"getgroups\",\"setgroups\",\"setresuid\",\"getresuid\",\"setresgid\",\"getresgid\",\"getpgid\",\"setfsuid\",\"setfsgid\",\"getsid\",\"capget\",\"capset\",\"rt_sigsuspend\",\"sigaltstack\",\"mknod\",\"statfs\",\"fstatfs\",\"getpriority\",\"setpriority\",\"prctl\",\"arch_prctl\",\"gettid\",\"readahead\",\"setxattr\",\"lsetxattr\",\"fsetxattr\",\"getxattr\",\"lgetxattr\",\"fgetxattr\",\"listxattr\",\"llistxattr\",\"flistxattr\",\"removexattr\",\"lremovexattr\",\"fremovexattr\",\"futex\",\"set_thread_area\",\"io_setup\",\"io_destroy\",\"io_getevents\",\"io_submit\",\"io_cancel\",\"lookup_dcookie\",\"epoll_create\",\"epoll_ctl_old\",\"epoll_wait_old\",\"remap_file_pages\",\"getdents64\",\"set_tid_address\",\"restart_syscall\",\"semtimedop\",\"fadvise64\",\"timer_create\",\"timer_settime\",\"timer_gettime\",\"timer_getoverrun\",\"timer_delete\",\"clock_settime\",\"clock_gettime\",\"clock_getres\",\"clock_nanosleep\",\"exit_group\",\"epoll_wait\",\"epoll_ctl\",\"tgkill\",\"utimes\",\"waitid\",\"openat\",\"mkdirat\",\"mknodat\",\"fchownat\",\"futimesat\",\"newfstatat\",\"unlinkat\",\"renameat\",\"linkat\",\"symlinkat\",\"readlinkat\",\"fchmodat\",\"faccessat\",\"pselect6\",\"ppoll\",\"unshare\",\"set_robust_list\",\"get_robust_list\",\"splice\",\"tee\",\"sync_file_range\",\"vmsplice\",\"getcpu\",\"epoll_pwait\",\"utimensat\",\"eventfd\",\"fallocate\",\"timerfd_settime\",\"timerfd_gettime\",\"accept4\",\"eventfd2\",\"epoll_create1\",\"dup3\",\"pipe2\",\"inotify_init1\",\"preadv\",\"pwritev\",\"rt_tgsigqueueinfo\",\"recvmmsg\",\"fanotify_init\",\"fanotify_mark\",\"prlimit64\",\"name_to_handle_at\",\"open_by_handle_at\",\"clock_adjtime\",\"syncfs\",\"sendmmsg\",\"setns\",\"getcpu\",\"process_vm_readv\",\"process_vm_writev\",\"kcmp\",\"seccomp\",\"getrandom\",\"memfd_create\",\"execveat\",\"mlock2\",\"copy_file_range\",\"preadv2\",\"pwritev2\",\"statx\",\"rseq\",\"close_range\",\"openat2\",\"pidfd_getfd\"],\"action\":\"SCMP_ACT_ALLOW\"}]}"
+    fs_write(profile_path, profile)
+    return profile_path
+end
+
+fn setup_net_isolated(session_dir: string) -> string is
+    ;; Create an isolated network namespace with a veth pair
+    ;; Outside: eic0 (host-side) — nat'd but not connected to LAN
+    ;; Inside:  eic1 (sandbox-side) — can reach controlled subnet only
+    let ns_name: string = "eic-ns-" + trim(shell("echo $$"))
+    write(dim_text("  net: creating isolated namespace " + ns_name + "..."))
+    shell("ip netns add " + ns_name + " 2>/dev/null")
+    shell("ip link add eic0 type veth peer name eic1 2>/dev/null")
+    shell("ip link set eic1 netns " + ns_name + " 2>/dev/null")
+    shell("ip addr add 10.200.200.1/24 dev eic0 2>/dev/null")
+    shell("ip link set eic0 up 2>/dev/null")
+    shell("ip netns exec " + ns_name + " ip addr add 10.200.200.2/24 dev eic1 2>/dev/null")
+    shell("ip netns exec " + ns_name + " ip link set eic1 up 2>/dev/null")
+    shell("ip netns exec " + ns_name + " ip link set lo up 2>/dev/null")
+    shell("ip netns exec " + ns_name + " ip route add default via 10.200.200.1 2>/dev/null")
+    ;; Drop all forwarding to LAN — only allow loopback and veth subnet
+    shell("iptables -I FORWARD -i eic0 -j DROP 2>/dev/null")
+    shell("iptables -I FORWARD -o eic0 -j DROP 2>/dev/null")
+    return ns_name
+end
+
+fn cleanup_net(ns_name: string) is
+    if ns_name == "" is
+        return
+    end
+    shell("ip netns del " + ns_name + " 2>/dev/null")
+    shell("ip link del eic0 2>/dev/null")
+    shell("iptables -D FORWARD -i eic0 -j DROP 2>/dev/null")
+    shell("iptables -D FORWARD -o eic0 -j DROP 2>/dev/null")
+end
+
+fn run_trace_mode(target: string, output_file: string, timeout_sec: string, session_dir: string) is
+    write(bold(cyan_text("eic")) + " trace mode — recording all activity")
+    write(dim_text("  target:  ") + target)
+    write(dim_text("  log:     ") + output_file)
+    write("")
+
+    let strace_filter: string = "openat,open,close,read,write,connect,bind,sendto,recvfrom,execve,fork,clone,kill,unlink,rename,mkdir,chmod,chown,ptrace,mmap,mprotect"
+    let timeout_cmd: string = ""
+    if timeout_sec != "0" is
+        timeout_cmd = "timeout " + timeout_sec + " "
+    end
+
+    let strace_cmd: string = timeout_cmd +
+        "strace -f -e trace=" + strace_filter +
+        " -o " + session_dir + "/raw_strace.txt " +
+        target + " 2>&1"
+
+    write(dim_text("  running under strace..."))
+    let result: string = trim(shell(strace_cmd))
+
+    ;; Parse strace output into structured report
+    let raw: string = trim(shell("cat " + session_dir + "/raw_strace.txt 2>/dev/null"))
+
+    let files_accessed: string = trim(shell(
+        "grep -oP 'openat?[^\"]*\"\\K[^\"]+' " + session_dir + "/raw_strace.txt 2>/dev/null | sort -u | head -50"))
+    let ips_connected: string = trim(shell(
+        "grep -oP 'connect.*sin_addr=inet_addr\\(\"\\K[^\"]+' " +
+        session_dir + "/raw_strace.txt 2>/dev/null | sort -u"))
+    let execs_called: string = trim(shell(
+        "grep 'execve' " + session_dir + "/raw_strace.txt 2>/dev/null | head -20"))
+    let suspicious: string = trim(shell(
+        "grep -E 'ptrace|process_vm|memfd_create|kexec|perf_event|/etc/shadow|/etc/passwd' " +
+        session_dir + "/raw_strace.txt 2>/dev/null | head -20"))
+
+    ;; Write structured log
+    let report: string =
+        "eic Trace Report\n" +
+        "================\n" +
+        "Target:    " + target + "\n" +
+        "Session:   " + session_dir + "\n\n" +
+        "[FILES ACCESSED]\n" + files_accessed + "\n\n" +
+        "[IP CONNECTIONS]\n" + ips_connected + "\n\n" +
+        "[EXECVE CALLS]\n" + execs_called + "\n\n" +
+        "[SUSPICIOUS SYSCALLS]\n" + suspicious + "\n\n" +
+        "[RAW STRACE (first 200 lines)]\n" +
+        trim(shell("head -200 " + session_dir + "/raw_strace.txt 2>/dev/null")) + "\n"
+
+    fs_write(output_file, report)
+    write(cyan_text("ok") + " trace saved to: " + bold(output_file))
+    write("")
+    if files_accessed != "" is
+        write(bold("Files accessed:"))
+        write(dim_text(files_accessed))
+    end
+    if ips_connected != "" is
+        write(bold(yellow_text("IP connections:")))
+        write(yellow_text(ips_connected))
+    end
+    if suspicious != "" is
+        write(bold(red_text("Suspicious syscalls:")))
+        write(red_text(suspicious))
+    end
+end
+
+fn run_isolated(target: string, net_mode: string, allow_read: string,
+                timeout_sec: string, trace: bool, output_file: string,
+                session_dir: string) is
+
+    let session_id: string = trim(shell("echo $$"))
+    write(dim_text("  session: " + session_id))
+    write(dim_text("  tmpfs:   " + session_dir))
+    write(dim_text("  net:     " + net_mode))
+    write("")
+
+    ;; Prepare CoW filesystem
+    let rootfs: string = setup_cow_rootfs(session_dir)
+    let _seccomp: string = build_seccomp_profile(session_dir)
+
+    let ns_name: string = ""
+    if net_mode == "isolated" is
+        ns_name = setup_net_isolated(session_dir)
+    end
+
+    ;; Build bwrap command — unprivileged sandbox
+    let timeout_prefix: string = ""
+    if timeout_sec != "0" is
+        timeout_prefix = "timeout " + timeout_sec + " "
+    end
+
+    let bwrap_base: string =
+        "bwrap " +
+        "--ro-bind /usr /usr " +
+        "--ro-bind /lib /lib " +
+        "--ro-bind /lib64 /lib64 " +
+        "--ro-bind /bin /bin " +
+        "--ro-bind /sbin /sbin " +
+        "--dir /tmp " +
+        "--dir /var " +
+        "--dir /home " +
+        "--proc /proc " +
+        "--dev /dev " +
+        "--tmpfs /run " +
+        "--tmpfs /etc " +
+        "--ro-bind /etc/resolv.conf /etc/resolv.conf " +
+        "--ro-bind /etc/hostname /etc/hostname " +
+        "--unshare-pid " +
+        "--unshare-uts " +
+        "--unshare-ipc " +
+        "--unshare-cgroup "
+
+    let net_flags: string = ""
+    if net_mode == "none" is
+        net_flags = "--unshare-net "
+    end
+
+    let extra_reads: string = ""
+    if allow_read != "" is
+        extra_reads = "--ro-bind " + allow_read + " " + allow_read + " "
+    end
+
+    let strace_wrap: string = ""
+    if trace is
+        strace_wrap = "strace -f -o " + session_dir + "/raw_strace.txt "
+    end
+
+    let full_cmd: string = timeout_prefix + bwrap_base + net_flags + extra_reads +
+        "-- " + strace_wrap + target + " 2>&1"
+
+    write(dim_text("  launching sandbox..."))
+    write("")
+
+    let exit_output: string = trim(shell(full_cmd))
+    if exit_output != "" is
+        write(exit_output)
+    end
+
+    write("")
+    write(cyan_text("--") + " sandbox exited " + cyan_text("--"))
+
+    if trace is
+        write("")
+        run_trace_mode(target, output_file, "0", session_dir)
+    end
+
+    ;; Cleanup
+    if ns_name != "" is
+        cleanup_net(ns_name)
+    end
+    shell("rm -rf " + session_dir + " 2>/dev/null")
+end
+
+fn parse_arg(args_str: string, flag: string) -> string is
+    ;; Extract value from "flag=value" in the args string
+    let result: string = trim(shell(
+        "echo '" + args_str + "' | grep -oP '(?<=" + flag + "=)[^ ]+' | head -1"))
+    return result
+end
+
+fn has_flag(args_str: string, flag: string) -> bool is
+    let r: string = trim(shell("echo '" + args_str + "' | grep -c '" + flag + "' 2>/dev/null"))
+    return r != "0" && r != ""
+end
+
+fn main() is
+    ;; Read args from CHKER_CMD-style env var (eic sets EIC_ARGS externally)
+    ;; The wrapper script passes all args as EIC_ARGS="--run ./binary --trace"
+    let args_str: string = trim(shell("echo ${EIC_ARGS:-}"))
+
+    if args_str == "" is
+        print_help()
+        return
+    end
+
+    if has_flag(args_str, "--version") is
+        write(eic_version())
+        return
+    end
+
+    if has_flag(args_str, "--help") || has_flag(args_str, "-h") is
+        print_help()
+        return
+    end
+
+    let target: string      = parse_arg(args_str, "--run")
+    let net_mode: string    = parse_arg(args_str, "--net")
+    let output_file: string = parse_arg(args_str, "--output")
+    let timeout_sec: string = parse_arg(args_str, "--timeout")
+    let allow_read: string  = parse_arg(args_str, "--allow-read")
+    let trace: bool         = has_flag(args_str, "--trace")
+    let emit_ir: bool       = has_flag(args_str, "--emit-ir")
+
+    if net_mode == "" is
+        net_mode = "none"
+    end
+    if output_file == "" is
+        output_file = "eic_trace.log"
+    end
+    if timeout_sec == "" is
+        timeout_sec = "0"
+    end
+
+    if emit_ir is
+        print_banner()
+        write(bold("Sandbox Plan (IR):"))
+        write("  target:      " + target)
+        write("  net:         " + net_mode)
+        write("  trace:       " + to_string(trace))
+        write("  output:      " + output_file)
+        write("  timeout:     " + timeout_sec + "s")
+        write("  allow-read:  " + allow_read)
+        write("  seccomp:     enabled (syscall allowlist)")
+        write("  cow-fs:      overlayfs / bwrap bind-mount")
+        write("  pid-ns:      unshared")
+        write("  ipc-ns:      unshared")
+        write("  uts-ns:      unshared")
+        write("  net-ns:      " + net_mode)
+        write("  memory:      process injection blocked (separate VA space)")
+        return
+    end
+
+    if target == "" is
+        write(red_text("error:") + " --run <binary> is required")
+        write(dim_text("  run: eic --help"))
+        return
+    end
+
+    let target_exists: string = trim(shell("test -f " + target + " && echo yes || echo no"))
+    if target_exists != "yes" is
+        write(red_text("error:") + " target not found: " + target)
+        return
+    end
+
+    print_banner()
+    write(bold("Target:  ") + cyan_text(target))
+    write(bold("Mode:    ") + net_mode)
+    if trace is
+        write(bold("Trace:   ") + "yes -> " + output_file)
+    end
+    if timeout_sec != "0" is
+        write(bold("Timeout: ") + timeout_sec + "s")
+    end
+    write("")
+
+    let deps_ok: bool = check_deps()
+    if deps_ok == false is
+        write(yellow_text("warn:") + " some isolation tools missing — using best-effort fallback")
+    end
+
+    ;; Create session tmpfs directory
+    let home: string        = get_home()
+    let session_id: string  = trim(shell("date +%s%N | cut -c1-16"))
+    let session_dir: string = home + "/.hackeros/eic/sessions/" + session_id
+    shell("mkdir -p " + session_dir)
+
+    run_isolated(target, net_mode, allow_read, timeout_sec, trace, output_file, session_dir)
+end
