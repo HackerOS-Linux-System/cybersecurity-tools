@@ -1,1 +1,192 @@
+use "std -> fs"   from "fs"
+use "std -> json" from "json"
+use "std -> str"  from "str"
+use "std -> iter" from "iter"
 
+use "src/ingest"   from "ingest"
+use "src/correlate" from "correlate"
+use "src/report"   from "report"
+use "src/process"  from "process"
+
+;; ── Configuration ────────────────────────────────────────────────────────────
+
+struct EiaConfig is
+    pub ingest_specs:  [string]
+    pub correlate:     bool
+    pub strict:        bool
+    pub export_format: string
+    pub theme:         string
+    pub output_path:   string
+    pub run_tool:      string
+    pub target:        string
+    pub timeout_sec:   int
+    pub verbose:       bool
+end
+
+fn default_config() -> EiaConfig is
+    return EiaConfig {
+        ingest_specs:  [],
+        correlate:     false,
+        strict:        false,
+        export_format: "html",
+        theme:         "dark-blue",
+        output_path:   "/tmp/eia_report.html",
+        run_tool:      "",
+        target:        "",
+        timeout_sec:   300,
+        verbose:       false,
+    }
+end
+
+;; ── Argument parser ───────────────────────────────────────────────────────────
+
+fn parse_args(args: [string]) -> EiaConfig is
+    let mut cfg = default_config()
+    let mut i: int = 1
+
+    while i < args.len() is
+        let arg = args[i]
+
+        if arg == "--help" || arg == "-h" is
+            print_help()
+            return cfg
+        end
+
+        if arg == "--correlate" is
+            cfg.correlate = true
+            i += 1
+            continue
+        end
+
+        if arg == "--strict" is
+            cfg.strict = true
+            i += 1
+            continue
+        end
+
+        if arg == "--verbose" || arg == "-v" is
+            cfg.verbose = true
+            i += 1
+            continue
+        end
+
+        ;; --key=value style
+        if arg.starts_with("--") is
+            let parts = str::split(arg, "=")
+            if parts.len() >= 2 is
+                let key = parts[0]
+                let val = iter::join(iter::skip(parts, 1), "=")
+
+                if key == "--ingest" is
+                    cfg.ingest_specs.push(val)
+                elsif key == "--export" is
+                    cfg.export_format = val
+                elsif key == "--theme" is
+                    cfg.theme = val
+                elsif key == "--output" is
+                    cfg.output_path = val
+                elsif key == "--run" is
+                    cfg.run_tool = val
+                elsif key == "--target" is
+                    cfg.target = val
+                elsif key == "--timeout" is
+                    cfg.timeout_sec = conv::str_to_int(val)
+                else
+                    write("eia: unknown flag: " + key)
+                end
+            end
+        end
+
+        i += 1
+    end
+
+    return cfg
+end
+
+fn print_help() is
+    write("eia v0.1  —  Pentest Orchestrator & Auto-Report Engine")
+    write("")
+    write("USAGE:")
+    write("  eia --ingest=TOOL:FILE [--ingest=...] [--correlate] [--export=html] [--output=PATH]")
+    write("  eia --run=nmap --target=TARGET [--timeout=SEC]")
+    write("")
+    write("INGEST TOOLS:")
+    write("  nmap:file.xml   — Parse Nmap XML output")
+    write("  eiv:file.json   — Parse eiv (SCADA/ICS scanner) output")
+    write("  jam:file.json   — Parse jam (JWT analyzer) output")
+    write("  burp:file.xml   — Parse Burp Suite export")
+    write("  manual:file.json — Manual findings JSON")
+    write("")
+    write("OPTIONS:")
+    write("  --correlate       Correlate findings across all ingested sources")
+    write("  --strict          Fail on any unrecognised input format")
+    write("  --export=FORMAT   Output format: html (default), md, json")
+    write("  --theme=THEME     HTML theme: dark-blue (default), light, terminal")
+    write("  --output=PATH     Output file path (default: /tmp/eia_report.html)")
+    write("  --run=TOOL        Run a tool and immediately ingest its output")
+    write("  --target=TARGET   Target for --run mode")
+    write("  --timeout=SEC     Subprocess timeout in seconds (default: 300)")
+    write("  --verbose,-v      Verbose progress output")
+    write("  --help,-h         Show this help")
+end
+
+;; ── Main ─────────────────────────────────────────────────────────────────────
+
+fn main() is
+    let args = env::args()
+
+    if args.len() <= 1 is
+        print_help()
+        return
+    end
+
+    let cfg = parse_args(args)
+    let mut state = ingest::empty_state()
+
+    ;; Phase 1: Run tool if requested (and auto-ingest its output)
+    if cfg.run_tool != "" is
+        write("[eia] Running: " + cfg.run_tool + " against " + cfg.target)
+        let result = process::run_tool(cfg.run_tool, cfg.target, cfg.timeout_sec)
+        match result.status is
+            "ok"  => write("[eia] Tool finished, ingesting output...")
+            "timeout" => write("[eia] Warning: tool timed out, partial results only")
+            _         => write("[eia] Tool error: " + result.stderr)
+        end
+        ;; Auto-ingest stdout of the run tool
+        let auto_spec = cfg.run_tool + ":__stdout__"
+        state = ingest::ingest_from_string(state, cfg.run_tool, result.stdout)
+    end
+
+    ;; Phase 2: Ingest all specified input files
+    let mut i: int = 0
+    while i < cfg.ingest_specs.len() is
+        let spec = cfg.ingest_specs[i]
+        if cfg.verbose is write("[eia] Ingesting: " + spec) end
+        state = ingest::ingest(state, spec, cfg.strict)
+        i += 1
+    end
+
+    if state.findings.len() == 0 && cfg.ingest_specs.len() > 0 is
+        write("[eia] Warning: no findings after ingestion")
+    else
+        write("[eia] Ingested {state.findings.len()} findings from {state.source_count} source(s)")
+    end
+
+    ;; Phase 3: Correlate
+    if cfg.correlate is
+        write("[eia] Correlating findings...")
+        state = correlate::run(state, cfg.strict)
+        write("[eia] Correlation complete: {state.high_risk_count} high-risk targets identified")
+    end
+
+    ;; Phase 4: Export
+    write("[eia] Generating {cfg.export_format} report -> {cfg.output_path}")
+    match cfg.export_format is
+        "html" => report::export_html(state, cfg.output_path, cfg.theme)
+        "md"   => report::export_markdown(state, cfg.output_path)
+        "json" => report::export_json(state, cfg.output_path)
+        _      => write("[eia] Unknown format: " + cfg.export_format + ", defaulting to html")
+    end
+
+    write("[eia] Done.")
+end
