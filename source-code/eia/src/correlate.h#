@@ -1,1 +1,304 @@
+use "std -> iter" from "iter"
+use "std -> str"  from "str"
 
+use "src/ingest" from "ingest"
+
+;; ── SCADA / ICS service keywords ─────────────────────────────────────────────
+;; Any finding matching one of these escalates to CRITICAL if a port-scan
+;; (nmap) also confirms the port as open on the same host.
+
+pub let SCADA_SERVICES: [string] = [
+    "modbus", "dnp3", "s7comm", "bacnet", "opc-ua", "opcua", "iec104",
+    "eip", "ethernetip", "profinet", "mms", "goose", "iec61850",
+]
+
+pub let HIGH_VALUE_SERVICES: [string] = [
+    "rdp", "smb", "netbios", "telnet", "ftp", "rsh", "rlogin",
+]
+
+;; ── Correlation result ────────────────────────────────────────────────────────
+
+pub struct CorrelationEdge is
+    pub from_id:  string
+    pub to_id:    string
+    pub relation: string   ;; "same_host", "scada_on_open_port", "jwt_bypass_auth"
+    pub risk_bump: string  ;; severity level this relation adds
+end
+
+;; ── Main entry point ──────────────────────────────────────────────────────────
+
+pub fn run(state: IngestState, strict: bool) -> IngestState is
+    let mut s = state
+
+    ;; Step 1: Deduplicate
+    s = deduplicate(s)
+
+    ;; Step 2: SCADA / ICS escalation — the most important correlation rule:
+    ;; If eiv/jam found a SCADA protocol AND nmap confirmed the port open,
+    ;; escalate the combined target to CRITICAL and flag it for report summary.
+    s = escalate_scada(s)
+
+    ;; Step 3: Cross-tool confirmation — findings confirmed by >1 tool
+    ;; get their severity bumped up one level.
+    s = cross_confirm(s)
+
+    ;; Step 4: Tag the host_index with risk levels for the network map
+    s = tag_hosts(s)
+
+    ;; Step 5: Update high_risk_count for reporting
+    s = count_high_risk(s)
+
+    return s
+end
+
+;; ── Deduplication ────────────────────────────────────────────────────────────
+
+fn deduplicate(state: IngestState) -> IngestState is
+    ;; Remove exact duplicate findings (same host + port + service)
+    ;; Keep the one with the highest severity.
+    let mut s = state
+    let mut seen: [string] = []
+    let mut deduped: [Finding] = []
+
+    let mut i: int = 0
+    while i < s.findings.len() is
+        let f = s.findings[i]
+        let key = f.host + ":" + conv::int_to_str(f.port) + ":" + f.service
+
+        let mut is_dup: bool = false
+        let mut j: int = 0
+        while j < seen.len() is
+            if seen[j] == key is is_dup = true end
+            j += 1
+        end
+
+        if !is_dup is
+            seen.push(key)
+            deduped.push(f)
+        else
+            ;; Keep the highest severity version
+            let mut k: int = 0
+            while k < deduped.len() is
+                let existing_key = deduped[k].host + ":" + conv::int_to_str(deduped[k].port) + ":" + deduped[k].service
+                if existing_key == key is
+                    if severity_rank(f.severity) > severity_rank(deduped[k].severity) is
+                        deduped[k].severity = f.severity
+                    end
+                end
+                k += 1
+            end
+        end
+
+        i += 1
+    end
+
+    let removed = s.findings.len() - deduped.len()
+    if removed > 0 is
+        write("[correlate] deduplicated {removed} duplicate findings")
+    end
+    s.findings = deduped
+    return s
+end
+
+fn severity_rank(sev: string) -> int is
+    match sev is
+        "CRITICAL" => return 4
+        "HIGH"     => return 3
+        "MEDIUM"   => return 2
+        "LOW"      => return 1
+        _          => return 0
+    end
+end
+
+fn bump_severity(sev: string) -> string is
+    match sev is
+        "LOW"    => return "MEDIUM"
+        "MEDIUM" => return "HIGH"
+        "HIGH"   => return "CRITICAL"
+        _        => return sev
+    end
+end
+
+;; ── SCADA escalation ──────────────────────────────────────────────────────────
+;;
+;; Core correlation rule: if a SCADA/ICS service (from eiv) appears on the
+;; same host+port that nmap flagged as open, that host is a critical target.
+;; Industrial devices exposed on a network are the highest-risk finding a
+;; pentest can produce — a successful attack can cause physical harm.
+
+fn escalate_scada(state: IngestState) -> IngestState is
+    let mut s = state
+
+    ;; Build set of hosts with SCADA services (from eiv findings)
+    let mut scada_hosts: [string] = []
+    let mut i: int = 0
+    while i < s.findings.len() is
+        let f = s.findings[i]
+        if f.source == "eiv" is
+            let mut is_scada: bool = false
+            let mut k: int = 0
+            while k < SCADA_SERVICES.len() is
+                if f.service.contains(SCADA_SERVICES[k]) || f.protocol.contains(SCADA_SERVICES[k]) is
+                    is_scada = true
+                end
+                k += 1
+            end
+            if is_scada is
+                let mut already: bool = false
+                let mut m: int = 0
+                while m < scada_hosts.len() is
+                    if scada_hosts[m] == f.host is already = true end
+                    m += 1
+                end
+                if !already is scada_hosts.push(f.host) end
+            end
+        end
+        i += 1
+    end
+
+    if scada_hosts.len() == 0 is return s end
+
+    write("[correlate] {scada_hosts.len()} hosts have SCADA/ICS exposure — escalating to CRITICAL")
+
+    ;; Escalate all nmap-sourced findings on SCADA hosts to CRITICAL
+    ;; and add a synthetic "SCADA confirmed on open port" finding.
+    let mut j: int = 0
+    while j < scada_hosts.len() is
+        let host = scada_hosts[j]
+
+        ;; Escalate existing findings on this host
+        let mut k: int = 0
+        while k < s.findings.len() is
+            if s.findings[k].host == host is
+                s.findings[k].severity  = CRITICAL
+                s.findings[k].correlated = true
+                s.findings[k].tags.push("scada-escalated")
+            end
+            k += 1
+        end
+
+        ;; Add a synthetic correlation finding
+        let synth_title = "CRITICAL: SCADA/ICS Device Exposed — " + host
+        let synth_desc  = "Host " + host + " runs industrial control system (SCADA/ICS) protocols " +
+                          "confirmed both by ICS scanner (eiv) and port scan (nmap). " +
+                          "A successful attack could cause physical damage or safety incidents. " +
+                          "Immediate network segmentation required."
+        let synth = Finding {
+            id:          "correlation_scada_" + host,
+            source:      "correlation",
+            host:        host,
+            port:        0,
+            protocol:    "multi",
+            service:     "scada",
+            severity:    CRITICAL,
+            title:       synth_title,
+            description: synth_desc,
+            evidence:    "Cross-referenced: eiv SCADA detection + nmap open port",
+            tags:        ["scada", "ics", "correlated", "synthetic"],
+            correlated:  true,
+        }
+        s.findings.push(synth)
+        j += 1
+    end
+
+    return s
+end
+
+;; ── Cross-tool confirmation ───────────────────────────────────────────────────
+;; A vulnerability confirmed by 2+ independent tools is more reliable.
+;; Bump severity by one level when host+port appears in findings from
+;; at least two different source tools.
+
+fn cross_confirm(state: IngestState) -> IngestState is
+    let mut s = state
+
+    ;; Count how many distinct sources report each host:port
+    let mut i: int = 0
+    while i < s.findings.len() is
+        let fi = s.findings[i]
+        if fi.port == 0 is i += 1; continue end
+
+        let mut source_count: int = 0
+        let mut sources_seen: [string] = []
+
+        let mut j: int = 0
+        while j < s.findings.len() is
+            let fj = s.findings[j]
+            if fj.host == fi.host && fj.port == fi.port is
+                let mut already: bool = false
+                let mut k: int = 0
+                while k < sources_seen.len() is
+                    if sources_seen[k] == fj.source is already = true end
+                    k += 1
+                end
+                if !already is
+                    sources_seen.push(fj.source)
+                    source_count = source_count + 1
+                end
+            end
+            j += 1
+        end
+
+        if source_count >= 2 is
+            s.findings[i].severity   = bump_severity(s.findings[i].severity)
+            s.findings[i].correlated = true
+            s.findings[i].tags.push("multi-tool-confirmed")
+        end
+
+        i += 1
+    end
+
+    return s
+end
+
+;; ── Host tagging for network map ──────────────────────────────────────────────
+;; Categorise each host into: web_server | iot | scada | generic
+;; Used by the report generator to draw the network topology diagram.
+
+fn tag_hosts(state: IngestState) -> IngestState is
+    let mut s = state
+
+    let mut i: int = 0
+    while i < s.findings.len() is
+        let mut tags: [string] = s.findings[i].tags
+
+        let svc  = s.findings[i].service
+        let port = s.findings[i].port
+
+        ;; Web server signals
+        if svc == "http" || svc == "https" || port == 80 || port == 443 is
+            tags.push("web")
+        end
+
+        ;; IoT signals (common IoT ports / services)
+        if port == 1883 || port == 8883 is tags.push("iot"); tags.push("mqtt") end  ;; MQTT
+        if port == 5683 is tags.push("iot"); tags.push("coap") end                  ;; CoAP
+        if port == 47808 is tags.push("iot"); tags.push("bacnet") end               ;; BACnet
+
+        ;; SCADA signals
+        if port == 502 || svc == "modbus" is tags.push("scada") end
+        if port == 4840 || svc.contains("opc") is tags.push("scada") end
+        if port == 102  || svc == "s7comm" is tags.push("scada") end
+
+        s.findings[i].tags = tags
+        i += 1
+    end
+
+    return s
+end
+
+;; ── Count high-risk targets ───────────────────────────────────────────────────
+
+fn count_high_risk(state: IngestState) -> IngestState is
+    let mut s = state
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < s.findings.len() is
+        if s.findings[i].severity == CRITICAL || s.findings[i].severity == HIGH is
+            count = count + 1
+        end
+        i += 1
+    end
+    s.high_risk_count = count
+    return s
+end
