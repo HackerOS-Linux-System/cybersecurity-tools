@@ -1,1 +1,429 @@
+use "std -> fs"   from "fs"
+use "std -> json" from "json"
+use "std -> str"  from "str"
+use "std -> iter" from "iter"
 
+;; ── Severity levels ───────────────────────────────────────────────────────────
+
+pub let CRITICAL: string = "CRITICAL"
+pub let HIGH:     string = "HIGH"
+pub let MEDIUM:   string = "MEDIUM"
+pub let LOW:      string = "LOW"
+pub let INFO:     string = "INFO"
+
+;; ── Core data structures ──────────────────────────────────────────────────────
+
+pub struct Finding is
+    pub id:          string    ;; "nmap_192.168.1.1_80"
+    pub source:      string    ;; "nmap", "eiv", "jam", "burp"
+    pub host:        string    ;; "192.168.1.1"
+    pub port:        int       ;; 80  (0 = not applicable)
+    pub protocol:    string    ;; "tcp", "udp", "http", "scada"
+    pub service:     string    ;; "http", "dnp3", "modbus", "jwt"
+    pub severity:    string    ;; CRITICAL|HIGH|MEDIUM|LOW|INFO
+    pub title:       string    ;; Short human-readable title
+    pub description: string    ;; Full technical description
+    pub evidence:    string    ;; PoC / raw tool output fragment
+    pub tags:        [string]  ;; ["scada", "ics", "open-port"]
+    pub correlated:  bool      ;; True once correlation engine has processed it
+end
+
+pub struct IngestState is
+    pub findings:        [Finding]
+    pub source_count:    int
+    pub host_index:      [string]   ;; Unique hosts seen
+    pub service_index:   [string]   ;; Unique services seen
+    pub high_risk_count: int
+    pub raw_sources:     [string]   ;; Filenames processed
+end
+
+;; ── Factory helpers ───────────────────────────────────────────────────────────
+
+pub fn empty_state() -> IngestState is
+    return IngestState {
+        findings:        [],
+        source_count:    0,
+        host_index:      [],
+        service_index:   [],
+        high_risk_count: 0,
+        raw_sources:     [],
+    }
+end
+
+fn make_finding(source: string, host: string, port: int,
+                protocol: string, service: string,
+                severity: string, title: string,
+                desc: string, evidence: string) -> Finding is
+    let id = source + "_" + host + "_" + conv::int_to_str(port)
+    let tags: [string] = []
+    return Finding {
+        id:          id,
+        source:      source,
+        host:        host,
+        port:        port,
+        protocol:    protocol,
+        service:     service,
+        severity:    severity,
+        title:       title,
+        description: desc,
+        evidence:    evidence,
+        tags:        tags,
+        correlated:  false,
+    }
+end
+
+fn add_finding(mut state: IngestState, f: Finding) -> IngestState is
+    state.findings.push(f)
+
+    ;; Update host index (deduplicate)
+    let host = state.findings[state.findings.len() - 1].host
+    let mut has_host = false
+    let mut j: int = 0
+    while j < state.host_index.len() is
+        if state.host_index[j] == host is has_host = true end
+        j += 1
+    end
+    if !has_host is state.host_index.push(host) end
+
+    return state
+end
+
+;; ── Dispatch ──────────────────────────────────────────────────────────────────
+
+pub fn ingest(state: IngestState, spec: string, strict: bool) -> IngestState is
+    ;; spec format: "tool:filepath"  (e.g. "nmap:/tmp/scan.xml")
+    let parts = str::split(spec, ":")
+    if parts.len() < 2 is
+        write("[ingest] bad spec (expected tool:file): " + spec)
+        return state
+    end
+
+    let tool = parts[0]
+    ;; Re-join the rest (path may contain colons on Windows / Windows-style paths)
+    let path = iter::join(iter::skip(parts, 1), ":")
+
+    let content = fs::read(path)
+    if content == "" is
+        write("[ingest] could not read: " + path)
+        return state
+    end
+
+    return ingest_from_string(state, tool, content)
+end
+
+pub fn ingest_from_string(state: IngestState, tool: string, content: string) -> IngestState is
+    let mut s = state
+    s.source_count = s.source_count + 1
+
+    match tool is
+        "nmap"   => return parse_nmap(s, content)
+        "eiv"    => return parse_eiv(s, content)
+        "jam"    => return parse_jam(s, content)
+        "burp"   => return parse_burp(s, content)
+        "manual" => return parse_manual(s, content)
+        _        => write("[ingest] unknown tool: " + tool)
+    end
+
+    return s
+end
+
+;; ── Nmap XML parser ───────────────────────────────────────────────────────────
+;; Parses Nmap XML line-by-line, extracting open ports and services.
+;; We use simple string matching (no real XML parser) which is fast and
+;; sufficient for the structured Nmap output format.
+
+fn parse_nmap(state: IngestState, xml: string) -> IngestState is
+    let mut s = state
+    let lines = str::split(xml, "\n")
+    let mut current_host: string = ""
+
+    let mut i: int = 0
+    while i < lines.len() is
+        let line = str::trim(lines[i])
+
+        ;; <address addr="192.168.1.1" .../>
+        if line.contains("addr=") && line.contains("addrtype=\"ipv4\"") is
+            current_host = extract_xml_attr(line, "addr")
+        end
+
+        ;; <port protocol="tcp" portid="80">
+        ;; followed by: <state state="open" .../>
+        ;; followed by: <service name="http" product="Apache" .../>
+        if line.contains("<port ") && current_host != "" is
+            let proto = extract_xml_attr(line, "protocol")
+            let portid = conv::str_to_int(extract_xml_attr(line, "portid"))
+
+            ;; Look ahead a few lines for state and service
+            let mut state_str: string = ""
+            let mut svc_name:  string = ""
+            let mut svc_prod:  string = ""
+            let mut j: int = i + 1
+            while j < lines.len() && j < i + 6 is
+                let ln = str::trim(lines[j])
+                if ln.contains("<state ") is
+                    state_str = extract_xml_attr(ln, "state")
+                end
+                if ln.contains("<service ") is
+                    svc_name = extract_xml_attr(ln, "name")
+                    svc_prod = extract_xml_attr(ln, "product")
+                end
+                j += 1
+            end
+
+            if state_str == "open" is
+                let svc = if svc_name != "" is svc_name else "unknown" end
+                let title = "Open port " + conv::int_to_str(portid) + "/" + proto + " (" + svc + ")"
+                let desc  = "Host " + current_host + " has " + svc + " open on port " + conv::int_to_str(portid)
+                let evidence = "nmap: " + current_host + " " + conv::int_to_str(portid) + "/" + proto + " open " + svc + " " + svc_prod
+
+                ;; Severity: well-known dangerous services escalate to HIGH
+                let sev = classify_port_severity(portid, svc)
+
+                let f = make_finding("nmap", current_host, portid, proto, svc, sev, title, desc, evidence)
+                s = add_finding(s, f)
+            end
+        end
+
+        i += 1
+    end
+
+    write("[nmap] parsed " + conv::int_to_str(s.findings.len()) + " open ports")
+    return s
+end
+
+fn classify_port_severity(port: int, service: string) -> string is
+    ;; Known dangerous / commonly exploited services → HIGH
+    if port == 23 || port == 21 || port == 513 || port == 514 is return HIGH end
+    if port == 445 || port == 139 is return HIGH end   ;; SMB
+    if port == 3389 is return HIGH end                  ;; RDP
+    if port == 4840 || port == 102 || port == 502 is   ;; OPC-UA, S7, Modbus
+        return CRITICAL
+    end
+    if service == "modbus" || service == "dnp3" || service == "s7comm" is
+        return CRITICAL
+    end
+    if service == "telnet" || service == "ftp" is return HIGH end
+    if port == 22 is return MEDIUM end  ;; SSH — open but lower severity
+    if port == 80 || port == 8080 is return LOW end
+    if port == 443 || port == 8443 is return INFO end
+    return INFO
+end
+
+;; ── eiv (HackerOS SCADA/ICS scanner) parser ──────────────────────────────────
+;; eiv outputs JSON with a top-level "findings" array.
+;; Each finding: { host, port, protocol, risk_level, description, raw }
+
+fn parse_eiv(state: IngestState, content: string) -> IngestState is
+    let mut s = state
+    let root = json::parse(content)
+
+    if json::is_null(root, "findings") is
+        write("[eiv] no 'findings' array in output")
+        return s
+    end
+
+    let items = json::get_arr(root, "findings")
+    let count = items.len()
+    let mut i: int = 0
+    while i < count is
+        let item = json::obj_at(items, i)
+        let host     = json::get_str(item, "host")
+        let port     = json::get_int(item, "port")
+        let proto    = json::get_str(item, "protocol")
+        let risk     = json::get_str(item, "risk_level")
+        let desc     = json::get_str(item, "description")
+        let raw      = json::get_str(item, "raw")
+
+        ;; Map eiv risk levels to eia severity
+        let sev = match risk is
+            "critical" => CRITICAL
+            "high"     => HIGH
+            "medium"   => MEDIUM
+            "low"      => LOW
+            _          => INFO
+        end
+
+        let title = "eiv: " + proto + " exposure on " + host + ":" + conv::int_to_str(port)
+        let f = make_finding("eiv", host, port, proto, proto, sev, title, desc, raw)
+        s = add_finding(s, f)
+        i += 1
+    end
+
+    write("[eiv] parsed " + conv::int_to_str(count) + " findings")
+    return s
+end
+
+;; ── jam (JWT analyzer) parser ─────────────────────────────────────────────────
+;; jam outputs JSON: { "tokens": [...] }
+;; Each token: { endpoint, algorithm, vulnerability, severity, token_sample }
+
+fn parse_jam(state: IngestState, content: string) -> IngestState is
+    let mut s = state
+    let root = json::parse(content)
+
+    if json::is_null(root, "tokens") is
+        write("[jam] no 'tokens' array in output")
+        return s
+    end
+
+    let items = json::get_arr(root, "tokens")
+    let count = items.len()
+    let mut i: int = 0
+    while i < count is
+        let item = json::obj_at(items, i)
+        let endpoint = json::get_str(item, "endpoint")
+        let alg      = json::get_str(item, "algorithm")
+        let vuln     = json::get_str(item, "vulnerability")
+        let risk     = json::get_str(item, "severity")
+        let sample   = json::get_str(item, "token_sample")
+
+        ;; Host extraction: "https://api.example.com/login" → "api.example.com"
+        let host = extract_host_from_url(endpoint)
+
+        let sev = match risk is
+            "critical" => CRITICAL
+            "high"     => HIGH
+            "medium"   => MEDIUM
+            _          => LOW
+        end
+
+        let title = "JWT " + vuln + " (" + alg + ") at " + endpoint
+        let desc  = "JSON Web Token vulnerability: " + vuln + ". Algorithm: " + alg
+        let evidence = "jam: endpoint=" + endpoint + " sample=" + sample
+
+        let f = make_finding("jam", host, 0, "http", "jwt", sev, title, desc, evidence)
+        s = add_finding(s, f)
+        i += 1
+    end
+
+    write("[jam] parsed " + conv::int_to_str(count) + " JWT issues")
+    return s
+end
+
+;; ── Burp Suite XML parser ─────────────────────────────────────────────────────
+;; Burp exports: <issues><issue><host>...<path>...<name>...<severity>...<detail>...
+
+fn parse_burp(state: IngestState, content: string) -> IngestState is
+    let mut s = state
+    let lines = str::split(content, "\n")
+
+    let mut host: string = ""
+    let mut title: string = ""
+    let mut sev:  string = ""
+    let mut desc: string = ""
+    let mut in_issue: bool = false
+
+    let mut i: int = 0
+    while i < lines.len() is
+        let line = str::trim(lines[i])
+
+        if line.contains("<issue>") is
+            in_issue = true
+            host  = ""
+            title = ""
+            sev   = ""
+            desc  = ""
+        end
+
+        if in_issue is
+            if line.contains("<host>") is
+                host = extract_xml_text(line, "host")
+            end
+            if line.contains("<name>") is
+                title = extract_xml_text(line, "name")
+            end
+            if line.contains("<severity>") is
+                let raw_sev = extract_xml_text(line, "severity")
+                sev = match str::to_lower(raw_sev) is
+                    "high"          => HIGH
+                    "medium"        => MEDIUM
+                    "low"           => LOW
+                    "information"   => INFO
+                    _               => INFO
+                end
+            end
+            if line.contains("<detail>") is
+                desc = extract_xml_text(line, "detail")
+            end
+        end
+
+        if line.contains("</issue>") && in_issue is
+            in_issue = false
+            if host != "" && title != "" is
+                let evidence = "burp: " + title + " at " + host
+                let f = make_finding("burp", host, 0, "http", "web", sev, title, desc, evidence)
+                s = add_finding(s, f)
+            end
+        end
+
+        i += 1
+    end
+
+    write("[burp] parsed " + conv::int_to_str(s.findings.len()) + " web findings")
+    return s
+end
+
+;; ── Manual findings JSON parser ───────────────────────────────────────────────
+;; Format: [{ host, port, severity, title, description }]
+
+fn parse_manual(state: IngestState, content: string) -> IngestState is
+    let mut s = state
+    let items = json::parse_array(content)
+    let count = items.len()
+    let mut i: int = 0
+    while i < count is
+        let item = json::obj_at(items, i)
+        let host  = json::get_str(item, "host")
+        let port  = json::get_int(item, "port")
+        let sev   = json::get_str(item, "severity")
+        let title = json::get_str(item, "title")
+        let desc  = json::get_str(item, "description")
+
+        let f = make_finding("manual", host, port, "manual", "manual", sev, title, desc, "manual finding")
+        s = add_finding(s, f)
+        i += 1
+    end
+
+    write("[manual] parsed " + conv::int_to_str(count) + " findings")
+    return s
+end
+
+;; ── XML / string utilities ────────────────────────────────────────────────────
+
+fn extract_xml_attr(line: string, attr: string) -> string is
+    ;; Finds  attr="VALUE"  or  attr='VALUE'  in a tag line
+    let search = attr + "=\""
+    if !line.contains(search) is return "" end
+    let parts = str::split(line, search)
+    if parts.len() < 2 is return "" end
+    let after = parts[1]
+    let val_parts = str::split(after, "\"")
+    if val_parts.len() < 1 is return "" end
+    return val_parts[0]
+end
+
+fn extract_xml_text(line: string, tag: string) -> string is
+    ;; Extracts text between <tag> and </tag> on a single line
+    let open  = "<"  + tag + ">"
+    let close = "</" + tag + ">"
+    if !line.contains(open) is return "" end
+    let parts1 = str::split(line, open)
+    if parts1.len() < 2 is return "" end
+    let parts2 = str::split(parts1[1], close)
+    if parts2.len() < 1 is return "" end
+    return parts2[0]
+end
+
+fn extract_host_from_url(url: string) -> string is
+    ;; "https://api.example.com/path" → "api.example.com"
+    let stripped = if url.starts_with("https://") is
+        url[8..url.len()]
+    elsif url.starts_with("http://") is
+        url[7..url.len()]
+    else
+        url
+    end
+    let parts = str::split(stripped, "/")
+    if parts.len() > 0 is return parts[0] end
+    return url
+end
