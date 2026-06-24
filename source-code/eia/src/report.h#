@@ -1,1 +1,346 @@
+use "std -> fs"   from "fs"
+use "std -> str"  from "str"
+use "std -> iter" from "iter"
 
+use "src/ingest" from "ingest"
+
+;; ── HTML themes ───────────────────────────────────────────────────────────────
+
+fn theme_css(theme: string) -> string is
+    match theme is
+        "light" => return "
+            body{font-family:sans-serif;background:#f8f9fa;color:#212529;margin:0;padding:0}
+            .header{background:#0d6efd;color:#fff;padding:24px 32px}
+            .card{background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);margin:20px;padding:24px}
+            .badge-critical{background:#dc3545;color:#fff;border-radius:4px;padding:3px 8px;font-weight:700}
+            .badge-high{background:#fd7e14;color:#fff;border-radius:4px;padding:3px 8px;font-weight:700}
+            .badge-medium{background:#ffc107;color:#000;border-radius:4px;padding:3px 8px;font-weight:700}
+            .badge-low{background:#0dcaf0;color:#000;border-radius:4px;padding:3px 8px}
+            .badge-info{background:#6c757d;color:#fff;border-radius:4px;padding:3px 8px}
+            table{width:100%;border-collapse:collapse}
+            th{background:#dee2e6;padding:10px;text-align:left}
+            td{padding:10px;border-bottom:1px solid #dee2e6}
+        "
+        "terminal" => return "
+            body{font-family:'Courier New',monospace;background:#0d0d0d;color:#00ff41;margin:0;padding:0}
+            .header{background:#111;border-bottom:2px solid #00ff41;padding:24px 32px}
+            .card{background:#111;border:1px solid #00ff41;margin:20px;padding:24px}
+            .badge-critical{background:#ff0000;color:#fff;border-radius:2px;padding:2px 6px;font-weight:700}
+            .badge-high{background:#ff6600;color:#fff;border-radius:2px;padding:2px 6px}
+            .badge-medium{background:#ffff00;color:#000;border-radius:2px;padding:2px 6px}
+            .badge-low{background:#00aaff;color:#fff;border-radius:2px;padding:2px 6px}
+            .badge-info{background:#666;color:#fff;border-radius:2px;padding:2px 6px}
+            table{width:100%;border-collapse:collapse}
+            th{background:#1a1a1a;padding:10px;text-align:left;border:1px solid #00ff41}
+            td{padding:10px;border:1px solid #333}
+            a{color:#00ff41}
+        "
+        _ => return "
+            body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0e1a;color:#e2e8f0;margin:0;padding:0}
+            .header{background:linear-gradient(135deg,#1e3a5f 0%,#0d2137 100%);padding:32px;border-bottom:2px solid #2563eb}
+            .header h1{margin:0;font-size:28px;color:#60a5fa}
+            .header p{margin:8px 0 0;color:#94a3b8}
+            .card{background:#111827;border:1px solid #1f2937;border-radius:10px;margin:20px;padding:28px}
+            .card h2{margin-top:0;color:#60a5fa;border-bottom:1px solid #1f2937;padding-bottom:12px}
+            .badge-critical{background:#7f1d1d;color:#fca5a5;border:1px solid #ef4444;border-radius:4px;padding:3px 10px;font-weight:700;font-size:12px}
+            .badge-high{background:#431407;color:#fdba74;border:1px solid #f97316;border-radius:4px;padding:3px 10px;font-weight:700;font-size:12px}
+            .badge-medium{background:#422006;color:#fde68a;border:1px solid #f59e0b;border-radius:4px;padding:3px 10px;font-size:12px}
+            .badge-low{background:#1e3a5f;color:#93c5fd;border:1px solid #3b82f6;border-radius:4px;padding:3px 10px;font-size:12px}
+            .badge-info{background:#1f2937;color:#9ca3af;border:1px solid #374151;border-radius:4px;padding:3px 10px;font-size:12px}
+            table{width:100%;border-collapse:collapse}
+            th{background:#1f2937;padding:12px;text-align:left;color:#94a3b8;font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.05em}
+            td{padding:12px;border-bottom:1px solid #1f2937;color:#e2e8f0;font-size:14px}
+            tr:hover td{background:#1f2937}
+            .stat{text-align:center;padding:16px}
+            .stat-num{font-size:42px;font-weight:700;color:#60a5fa}
+            .stat-label{font-size:13px;color:#94a3b8;margin-top:4px}
+            details summary{cursor:pointer;padding:8px 0;color:#60a5fa;font-weight:600}
+            pre{background:#0d1117;border:1px solid #1f2937;border-radius:6px;padding:16px;font-size:12px;overflow-x:auto;color:#a5f3fc}
+        "
+    end
+end
+
+;; ── Severity badge ────────────────────────────────────────────────────────────
+
+fn badge(sev: string) -> string is
+    let cls = match sev is
+        "CRITICAL" => "badge-critical"
+        "HIGH"     => "badge-high"
+        "MEDIUM"   => "badge-medium"
+        "LOW"      => "badge-low"
+        _          => "badge-info"
+    end
+    return "<span class=\"" + cls + "\">" + sev + "</span>"
+end
+
+;; ── Counters ──────────────────────────────────────────────────────────────────
+
+fn count_sev(findings: [Finding], sev: string) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < findings.len() is
+        if findings[i].severity == sev is n = n + 1 end
+        i += 1
+    end
+    return n
+end
+
+fn overall_status(state: IngestState) -> string is
+    let crit = count_sev(state.findings, "CRITICAL")
+    let high = count_sev(state.findings, "HIGH")
+    if crit > 0 is return "CRITICAL RISK" end
+    if high > 0 is return "HIGH RISK" end
+    if state.findings.len() > 0 is return "MODERATE RISK" end
+    return "LOW RISK"
+end
+
+;; ── HTML export ───────────────────────────────────────────────────────────────
+
+pub fn export_html(state: IngestState, path: string, theme: string) is
+    let critical = count_sev(state.findings, "CRITICAL")
+    let high     = count_sev(state.findings, "HIGH")
+    let medium   = count_sev(state.findings, "MEDIUM")
+    let low      = count_sev(state.findings, "LOW")
+    let info_n   = count_sev(state.findings, "INFO")
+    let status   = overall_status(state)
+
+    let mut html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+    html = html + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    html = html + "<title>eia Pentest Report</title><style>"
+    html = html + theme_css(theme)
+    html = html + "*{box-sizing:border-box}.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin:20px}"
+    html = html + ".finding{border-left:4px solid;margin-bottom:12px;padding:12px 16px;border-radius:0 6px 6px 0}"
+    html = html + ".finding-critical{border-color:#ef4444;background:#1a0a0a}"
+    html = html + ".finding-high{border-color:#f97316;background:#1a0d07}"
+    html = html + ".finding-medium{border-color:#f59e0b;background:#1a1407}"
+    html = html + ".finding-low{border-color:#3b82f6;background:#0d1a2a}"
+    html = html + ".finding-info{border-color:#374151;background:#111}"
+    html = html + ".nw-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:12px}"
+    html = html + ".nw-host{border:1px solid #1f2937;border-radius:6px;padding:12px;font-size:13px}"
+    html = html + ".nw-critical{border-color:#ef4444}.nw-high{border-color:#f97316}"
+    html = html + ".nw-medium{border-color:#f59e0b}.nw-low{border-color:#3b82f6}"
+    html = html + "</style></head><body>"
+
+    ;; ── Header ──
+    html = html + "<div class=\"header\">"
+    html = html + "<h1>eia Pentest Report</h1>"
+    html = html + "<p>Generated by eia v0.1 &mdash; HackerOS Security Platform &mdash; " + conv::int_to_str(state.source_count) + " source(s) ingested</p>"
+    html = html + "</div>"
+
+    ;; ── Section 1: Executive Summary ──
+    html = html + "<div class=\"card\"><h2>1. Executive Summary</h2>"
+    html = html + "<p style=\"font-size:18px\">Overall Risk: <strong>" + status + "</strong></p>"
+    html = html + "<div class=\"stats\">"
+    html = html + "<div class=\"stat\"><div class=\"stat-num\" style=\"color:#ef4444\">" + conv::int_to_str(critical) + "</div><div class=\"stat-label\">CRITICAL</div></div>"
+    html = html + "<div class=\"stat\"><div class=\"stat-num\" style=\"color:#f97316\">" + conv::int_to_str(high)     + "</div><div class=\"stat-label\">HIGH</div></div>"
+    html = html + "<div class=\"stat\"><div class=\"stat-num\" style=\"color:#f59e0b\">" + conv::int_to_str(medium)   + "</div><div class=\"stat-label\">MEDIUM</div></div>"
+    html = html + "<div class=\"stat\"><div class=\"stat-num\" style=\"color:#3b82f6\">" + conv::int_to_str(low)      + "</div><div class=\"stat-label\">LOW</div></div>"
+    html = html + "<div class=\"stat\"><div class=\"stat-num\" style=\"color:#6b7280\">" + conv::int_to_str(info_n)   + "</div><div class=\"stat-label\">INFO</div></div>"
+    html = html + "</div>"
+
+    if critical > 0 is
+        html = html + "<div style=\"background:#1a0a0a;border:1px solid #ef4444;border-radius:6px;padding:16px;margin-top:16px\">"
+        html = html + "<strong style=\"color:#ef4444\">&#9888; Immediate Action Required</strong><br>"
+        html = html + conv::int_to_str(critical) + " CRITICAL finding(s) require emergency remediation. "
+        if state.high_risk_count > critical is
+            html = html + conv::int_to_str(high) + " HIGH severity findings also need urgent attention."
+        end
+        html = html + "</div>"
+    end
+
+    html = html + "</div>"
+
+    ;; ── Section 2: Network Map ──
+    html = html + "<div class=\"card\"><h2>2. Network Map</h2>"
+    html = html + "<p style=\"color:#94a3b8;font-size:14px\">All unique hosts discovered across all ingested sources, colour-coded by highest finding severity.</p>"
+    html = html + "<div class=\"nw-grid\">"
+
+    let mut hi: int = 0
+    while hi < state.host_index.len() is
+        let host = state.host_index[hi]
+        let mut host_sev:  string = "INFO"
+        let mut host_svcs: [string] = []
+
+        let mut fi: int = 0
+        while fi < state.findings.len() is
+            let f = state.findings[fi]
+            if f.host == host is
+                if severity_rank(f.severity) > severity_rank(host_sev) is
+                    host_sev = f.severity
+                end
+                if f.service != "" && f.service != "manual" is
+                    host_svcs.push(f.service)
+                end
+            end
+            fi += 1
+        end
+
+        let cls = "nw-host nw-" + str::to_lower(host_sev)
+        html = html + "<div class=\"" + cls + "\">"
+        html = html + "<div style=\"font-weight:600;margin-bottom:6px\">" + host + "</div>"
+        html = html + badge(host_sev)
+        if host_svcs.len() > 0 is
+            html = html + "<div style=\"margin-top:8px;font-size:11px;color:#94a3b8\">"
+            html = html + iter::join(host_svcs, ", ")
+            html = html + "</div>"
+        end
+        html = html + "</div>"
+        hi += 1
+    end
+    html = html + "</div></div>"
+
+    ;; ── Section 3: Technical Breakdown ──
+    html = html + "<div class=\"card\"><h2>3. Technical Breakdown</h2>"
+    html = html + "<p style=\"color:#94a3b8;font-size:14px\">" + conv::int_to_str(state.findings.len()) + " total findings, sorted by severity.</p>"
+
+    ;; Sort by severity (CRITICAL first)
+    let ordered: [string] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    let mut oi: int = 0
+    while oi < ordered.len() is
+        let sev = ordered[oi]
+        let sev_count = count_sev(state.findings, sev)
+        if sev_count > 0 is
+            html = html + "<details open><summary>" + sev + " (" + conv::int_to_str(sev_count) + ")</summary>"
+            let mut fi: int = 0
+            while fi < state.findings.len() is
+                let f = state.findings[fi]
+                if f.severity == sev is
+                    let cls = "finding finding-" + str::to_lower(f.severity)
+                    html = html + "<div class=\"" + cls + "\">"
+                    html = html + "<div style=\"display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px\">"
+                    html = html + "<strong style=\"font-size:15px\">" + f.title + "</strong>"
+                    html = html + "<span style=\"white-space:nowrap;margin-left:12px\">"
+                    html = html + badge(f.severity)
+                    html = html + " <span style=\"color:#94a3b8;font-size:12px\">[" + f.source + "]</span></span>"
+                    html = html + "</div>"
+                    html = html + "<div style=\"color:#94a3b8;font-size:13px;margin-bottom:8px\">"
+                    html = html + "Host: " + f.host
+                    if f.port > 0 is
+                        html = html + " &nbsp;&bull;&nbsp; Port: " + conv::int_to_str(f.port) + "/" + f.protocol
+                    end
+                    html = html + " &nbsp;&bull;&nbsp; Service: " + f.service
+                    html = html + "</div>"
+                    html = html + "<p style=\"margin:8px 0;font-size:14px;color:#e2e8f0\">" + f.description + "</p>"
+                    if f.evidence != "" is
+                        html = html + "<details style=\"margin-top:8px\"><summary style=\"font-size:13px\">Evidence / PoC</summary>"
+                        html = html + "<pre>" + f.evidence + "</pre></details>"
+                    end
+                    html = html + "</div>"
+                end
+                fi += 1
+            end
+            html = html + "</details>"
+        end
+        oi += 1
+    end
+
+    html = html + "</div>"
+
+    ;; Footer
+    html = html + "<div style=\"text-align:center;padding:24px;color:#4b5563;font-size:12px\">"
+    html = html + "eia v0.1 &mdash; HackerOS &mdash; This report is confidential and for authorized use only."
+    html = html + "</div></body></html>"
+
+    fs::write(path, html)
+    write("[report] HTML report written: " + path + " (" + conv::int_to_str(html.len()) + " bytes)")
+end
+
+fn severity_rank(sev: string) -> int is
+    match sev is
+        "CRITICAL" => return 4
+        "HIGH"     => return 3
+        "MEDIUM"   => return 2
+        "LOW"      => return 1
+        _          => return 0
+    end
+end
+
+;; ── Markdown export ───────────────────────────────────────────────────────────
+
+pub fn export_markdown(state: IngestState, path: string) is
+    let mut md: string = "# eia Pentest Report\n\n"
+    md = md + "> Generated by eia v0.1 — HackerOS Security Platform\n\n"
+    md = md + "## Executive Summary\n\n"
+    md = md + "| Severity | Count |\n|----------|-------|\n"
+    md = md + "| 🔴 CRITICAL | " + conv::int_to_str(count_sev(state.findings, "CRITICAL")) + " |\n"
+    md = md + "| 🟠 HIGH     | " + conv::int_to_str(count_sev(state.findings, "HIGH")) + " |\n"
+    md = md + "| 🟡 MEDIUM   | " + conv::int_to_str(count_sev(state.findings, "MEDIUM")) + " |\n"
+    md = md + "| 🔵 LOW      | " + conv::int_to_str(count_sev(state.findings, "LOW")) + " |\n"
+    md = md + "| ⚪ INFO     | " + conv::int_to_str(count_sev(state.findings, "INFO")) + " |\n\n"
+    md = md + "**Hosts discovered:** " + conv::int_to_str(state.host_index.len()) + "\n\n"
+    md = md + "## Findings\n\n"
+
+    let ordered: [string] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    let mut oi: int = 0
+    while oi < ordered.len() is
+        let sev = ordered[oi]
+        let sev_count = count_sev(state.findings, sev)
+        if sev_count > 0 is
+            md = md + "### " + sev + "\n\n"
+            let mut fi: int = 0
+            while fi < state.findings.len() is
+                let f = state.findings[fi]
+                if f.severity == sev is
+                    md = md + "#### " + f.title + "\n\n"
+                    md = md + "- **Host:** " + f.host + "\n"
+                    if f.port > 0 is
+                        md = md + "- **Port:** " + conv::int_to_str(f.port) + "/" + f.protocol + "\n"
+                    end
+                    md = md + "- **Service:** " + f.service + "\n"
+                    md = md + "- **Source:** " + f.source + "\n\n"
+                    md = md + f.description + "\n\n"
+                    if f.evidence != "" is
+                        md = md + "```\n" + f.evidence + "\n```\n\n"
+                    end
+                    md = md + "---\n\n"
+                end
+                fi += 1
+            end
+        end
+        oi += 1
+    end
+
+    fs::write(path, md)
+    write("[report] Markdown report written: " + path)
+end
+
+;; ── JSON export ───────────────────────────────────────────────────────────────
+
+pub fn export_json(state: IngestState, path: string) is
+    ;; Build a JSON structure manually (simple, no external deps)
+    let mut out: string = "{{"
+    out = out + "\"meta\":{{\"generator\":\"eia v0.1\",\"source_count\":" + conv::int_to_str(state.source_count) + "}},"
+    out = out + "\"summary\":{{\"total\":" + conv::int_to_str(state.findings.len()) + ","
+    out = out + "\"critical\":" + conv::int_to_str(count_sev(state.findings, "CRITICAL")) + ","
+    out = out + "\"high\":" + conv::int_to_str(count_sev(state.findings, "HIGH")) + ","
+    out = out + "\"medium\":" + conv::int_to_str(count_sev(state.findings, "MEDIUM")) + ","
+    out = out + "\"low\":" + conv::int_to_str(count_sev(state.findings, "LOW")) + "}},"
+    out = out + "\"findings\":["
+
+    let mut fi: int = 0
+    while fi < state.findings.len() is
+        let f = state.findings[fi]
+        if fi > 0 is out = out + "," end
+        out = out + "{{"
+        out = out + "\"id\":\"" + f.id + "\","
+        out = out + "\"source\":\"" + f.source + "\","
+        out = out + "\"host\":\"" + f.host + "\","
+        out = out + "\"port\":" + conv::int_to_str(f.port) + ","
+        out = out + "\"severity\":\"" + f.severity + "\","
+        out = out + "\"title\":\"" + json_escape(f.title) + "\","
+        out = out + "\"description\":\"" + json_escape(f.description) + "\""
+        out = out + "}}"
+        fi += 1
+    end
+
+    out = out + "]}}"
+    fs::write(path, out)
+    write("[report] JSON report written: " + path)
+end
+
+fn json_escape(s: string) -> string is
+    let mut result = str::replace(s, "\\", "\\\\")
+    result = str::replace(result, "\"", "\\\"")
+    result = str::replace(result, "\n", "\\n")
+    return result
+end
