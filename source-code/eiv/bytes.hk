@@ -1,1 +1,11 @@
+[package]
+-> name    => eiv
+-> version => 0.1
 
+[build]
+-> lang   => h#
+-> entry  => src/main.h#
+-> output => build/eiv
+
+[deps]
+-> libc => dynamic
