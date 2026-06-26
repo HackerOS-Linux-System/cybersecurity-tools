@@ -1,1 +1,543 @@
+mod net
+mod proto
 
+;; ── Tylko libc — jedyna zewnętrzna zależność ──────────────────────────────────
+extern dynamic [c] is
+    fn exit(code: int)
+    fn getenv(name: string) -> string
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; Typy wyników
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+struct ScanReport is
+    pub module:   string
+    pub target:   string
+    pub findings: int
+    pub risk:     int       ;; 0-100
+    pub json:     string
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; Narzędzia wyświetlania
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn banner() is
+    write("")
+    write("  \x1b[1;32m┌─────────────────────────────────────────────────┐\x1b[0m")
+    write("  \x1b[1;32m│\x1b[0m  \x1b[1;37meiv\x1b[0m  specialized recon scanner  \x1b[1;32mv0.8\x1b[0m          \x1b[1;32m│\x1b[0m")
+    write("  \x1b[1;32m│\x1b[0m  \x1b[2mSCADA · IoT · Web3  —  100% H#\x1b[0m                \x1b[1;32m│\x1b[0m")
+    write("  \x1b[1;32m└─────────────────────────────────────────────────┘\x1b[0m")
+    write("")
+end
+
+fn col_risk(risk: string) -> string is
+    if risk == "CRITICAL" is return "\x1b[1;31m" + risk + "\x1b[0m" end
+    if risk == "HIGH"     is return "\x1b[31m"   + risk + "\x1b[0m" end
+    if risk == "MEDIUM"   is return "\x1b[33m"   + risk + "\x1b[0m" end
+    if risk == "LOW"      is return "\x1b[32m"   + risk + "\x1b[0m" end
+    return risk
+end
+
+fn severity_score(s: string) -> int is
+    if s == "CRITICAL" is return 95 end
+    if s == "HIGH"     is return 75 end
+    if s == "MEDIUM"   is return 50 end
+    if s == "LOW"      is return 25 end
+    return 0
+end
+
+fn fmt_offset(off: int) -> string is
+    ;; prosty hex bez std::fmt
+    return "0x" + to_hex(off)
+end
+
+fn usage() is
+    write("  \x1b[1mUżycie:\x1b[0m  eiv --module=<mod> [opcje]")
+    write("")
+    write("  \x1b[1mModuły:\x1b[0m")
+    write("    \x1b[36mscada\x1b[0m  --target=<ip|cidr>  [--ports=default|all]")
+    write("    \x1b[35miot\x1b[0m    --target=<ip>  [--aggressive]")
+    write("    \x1b[33mweb3\x1b[0m   --source=<plik.hex>")
+    write("")
+    write("  \x1b[1mPrzykłady:\x1b[0m")
+    write("    eiv --module=scada  --target=10.0.0.0/24")
+    write("    eiv --module=iot    --target=192.168.1.50 --aggressive")
+    write("    eiv --module=web3   --source=./contract.hex")
+    write("")
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; MODULE: SCADA
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn scada_risk_label(res: proto::ModbusResult) -> string is
+    if !res.found is return "NONE" end
+    return res.risk
+end
+
+fn run_scada(target: string, all_ports: bool) -> ScanReport is
+    write("  \x1b[1;36m[SCADA]\x1b[0m " + target)
+    write("  \x1b[2mProtokoly: Modbus/502 · BACnet/47808 · EtherNet\\/IP/44818 · Profinet/34964\x1b[0m")
+    write("")
+
+    let mut findings: int    = 0
+    let mut risk_sum: int    = 0
+    let mut json:     string = "["
+
+    ;; ── Modbus TCP ──
+    write("  \x1b[2mskanuję Modbus TCP...\x1b[0m")
+    let mb: proto::ModbusResult = proto::modbus_scan(target)
+    if mb.found is
+        findings += 1
+        risk_sum += severity_score(mb.risk)
+        write("  \x1b[32m✓\x1b[0m  \x1b[1mModbus TCP\x1b[0m  " + target + ":502")
+        write("        coile   : " + to_string(mb.coil_count))
+        write("        firmware: " + mb.firmware)
+        write("        ryzyko  : " + col_risk(mb.risk))
+        if mb.coil_count > 100 is
+            write("        \x1b[33m⚠\x1b[0m  dużo coili — sprawdź autoryzację")
+        end
+        write("")
+        json = json + "{\"proto\":\"Modbus\",\"ip\":\"" + target +
+               "\",\"coils\":" + to_string(mb.coil_count) +
+               ",\"risk\":\"" + mb.risk + "\"}"
+    else is
+        write("  \x1b[2m─\x1b[0m  Modbus TCP      brak odpowiedzi")
+    end
+
+    ;; ── BACnet ──
+    write("  \x1b[2mskanuję BACnet/IP...\x1b[0m")
+    let bac: bool = proto::bacnet_scan(target)
+    if bac is
+        findings += 1
+        risk_sum += 65
+        let sep: string = if findings > 1 then "," else "" end
+        write("  \x1b[32m✓\x1b[0m  \x1b[1mBACnet/IP\x1b[0m   " + target + ":47808")
+        write("        ryzyko  : " + col_risk("HIGH"))
+        write("        uwaga   : brak natywnego szyfrowania w BACnet")
+        write("")
+        json = json + sep + "{\"proto\":\"BACnet\",\"ip\":\"" + target + "\",\"risk\":\"HIGH\"}"
+    else is
+        write("  \x1b[2m─\x1b[0m  BACnet/IP       brak odpowiedzi")
+    end
+
+    ;; ── EtherNet/IP ──
+    write("  \x1b[2mskanuję EtherNet/IP...\x1b[0m")
+    let eip: bool = proto::ethernetip_scan(target)
+    if eip is
+        findings += 1
+        risk_sum += 55
+        let sep: string = if findings > 1 then "," else "" end
+        write("  \x1b[32m✓\x1b[0m  \x1b[1mEtherNet/IP\x1b[0m " + target + ":44818")
+        write("        ryzyko  : " + col_risk("MEDIUM"))
+        write("")
+        json = json + sep + "{\"proto\":\"EtherNetIP\",\"ip\":\"" + target + "\",\"risk\":\"MEDIUM\"}"
+    else is
+        write("  \x1b[2m─\x1b[0m  EtherNet/IP     brak odpowiedzi")
+    end
+
+    ;; ── Profinet ──
+    if all_ports is
+        write("  \x1b[2mskanuję Profinet...\x1b[0m")
+        let pn: bool = proto::profinet_scan(target)
+        if pn is
+            findings += 1
+            risk_sum += 50
+            let sep: string = if findings > 1 then "," else "" end
+            write("  \x1b[32m✓\x1b[0m  \x1b[1mProfinet\x1b[0m    " + target + ":34964")
+            write("        ryzyko  : " + col_risk("MEDIUM"))
+            write("")
+            json = json + sep + "{\"proto\":\"Profinet\",\"ip\":\"" + target + "\",\"risk\":\"MEDIUM\"}"
+        else is
+            write("  \x1b[2m─\x1b[0m  Profinet        brak odpowiedzi")
+        end
+    end
+
+    json = json + "]"
+
+    let final_risk: int = if findings > 0 then risk_sum / findings else 0 end
+
+    write("")
+    write("  \x1b[2m──────────────────────────────────────────────────\x1b[0m")
+    write("  Urządzeń: " + to_string(findings) + "  |  ryzyko: " + to_string(final_risk) + "/100")
+    write("")
+
+    return ScanReport {
+        module:   "scada",
+        target:   target,
+        findings: findings,
+        risk:     final_risk,
+        json:     json,
+    }
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; MODULE: IoT
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+struct IoTResult is
+    pub ip:        string
+    pub telnet:    bool
+    pub ssh:       bool
+    pub http:      bool
+    pub upnp:      bool
+    pub mdns:      bool
+    pub open_ports: string
+    pub cves:      string
+    pub risk:      string
+end
+
+fn iot_classify(telnet: bool, upnp: bool, open: int) -> string is
+    if telnet is return "CRITICAL" end
+    if upnp   is return "HIGH"    end
+    if open > 5 is return "MEDIUM" end
+    return "LOW"
+end
+
+fn iot_scan_host(ip: string, aggressive: bool) -> IoTResult is
+    let mut ports: string = ""
+    let mut count: int    = 0
+    let mut cves:  string = ""
+
+    ;; Telnet — zawsze sprawdzamy (CRITICAL)
+    let tel_banner: string = net::tcp_banner(ip, 23, 1500)
+    let has_telnet: bool   = string_len(tel_banner) > 0
+    if has_telnet is
+        count += 1
+        ports  = ports + "23/tcp(Telnet!) "
+        cves   = cves  + "CVE-2017-7577 "
+    end
+
+    ;; SSH
+    let ssh_banner: string = net::tcp_banner(ip, 22, 1500)
+    let has_ssh:    bool   = string_len(ssh_banner) > 0
+    if has_ssh is
+        count += 1
+        ports  = ports + "22/tcp(SSH) "
+        ;; Sprawdź słaby banner (OpenSSH < 7)
+        if string_contains(ssh_banner, "OpenSSH_6") ||
+           string_contains(ssh_banner, "OpenSSH_5") is
+            cves = cves + "CVE-2016-6515 "
+        end
+    end
+
+    ;; HTTP
+    let http_banner: string = net::tcp_banner(ip, 80, 1500)
+    let has_http:    bool   = string_len(http_banner) > 0
+    if has_http is
+        count += 1
+        ports  = ports + "80/tcp(HTTP) "
+        ;; Szukaj paneli admina urządzeń IoT
+        if string_contains(http_banner, "mini_httpd") ||
+           string_contains(http_banner, "GoAhead")    ||
+           string_contains(http_banner, "Boa/0") is
+            cves = cves + "CVE-2019-9670 "
+        end
+    end
+
+    ;; UPnP
+    let has_upnp: bool = proto::upnp_scan(ip)
+    if has_upnp is
+        cves = cves + "CVE-2020-12695 "
+    end
+
+    ;; mDNS (tylko aggressive)
+    let has_mdns: bool = if aggressive then proto::mdns_probe(ip) else false end
+
+    ;; RTSP (kamery IP) — tylko aggressive
+    if aggressive is
+        let rtsp_banner: string = net::tcp_banner(ip, 554, 1000)
+        if string_len(rtsp_banner) > 0 is
+            count += 1
+            ports  = ports + "554/tcp(RTSP) "
+            cves   = cves  + "CVE-2018-10088 "
+        end
+
+        ;; MQTT
+        let mqtt_banner: string = net::tcp_banner(ip, 1883, 1000)
+        if string_len(mqtt_banner) > 0 is
+            count += 1
+            ports  = ports + "1883/tcp(MQTT) "
+        end
+    end
+
+    let risk: string = iot_classify(has_telnet, has_upnp, count)
+
+    return IoTResult {
+        ip:         ip,
+        telnet:     has_telnet,
+        ssh:        has_ssh,
+        http:       has_http,
+        upnp:       has_upnp,
+        mdns:       has_mdns,
+        open_ports: ports,
+        cves:       cves,
+        risk:       risk,
+    }
+end
+
+fn run_iot(target: string, aggressive: bool) -> ScanReport is
+    write("  \x1b[1;35m[IoT]\x1b[0m " + target)
+    if aggressive is
+        write("  \x1b[2mTryb: aggressive — rozszerzony zakres portów\x1b[0m")
+    end
+    write("")
+
+    let res: IoTResult = iot_scan_host(target, aggressive)
+    let mut findings:  int = 0
+
+    if res.telnet is
+        findings += 1
+        write("  \x1b[1;31m[CRITICAL]\x1b[0m Telnet otwarty — " + target + ":23")
+        write("             Cleartext credentials! Natychmiastowa naprawa wymagana.")
+        write("")
+    end
+
+    if res.upnp is
+        findings += 1
+        write("  \x1b[31m[HIGH]\x1b[0m     UPnP wykryty — port 1900/udp")
+        write("             Możliwe przekierowanie portów przez atakującego.")
+        write("")
+    end
+
+    if res.http is
+        findings += 1
+        write("  \x1b[33m[MEDIUM]\x1b[0m   Panel HTTP — " + target + ":80")
+        write("             Sprawdź domyślne hasła i wersję firmware.")
+        write("")
+    end
+
+    if res.ssh is
+        write("  \x1b[2m[INFO]\x1b[0m     SSH — " + target + ":22")
+        if string_contains(res.cves, "CVE-2016-6515") is
+            write("             \x1b[33m⚠\x1b[0m Słaba wersja OpenSSH — zaktualizuj")
+        end
+        write("")
+    end
+
+    if res.open_ports != "" is
+        write("  Otwarte porty : " + res.open_ports)
+    end
+    if res.cves != "" is
+        write("  CVE           : \x1b[33m" + res.cves + "\x1b[0m")
+    end
+    write("  Ryzyko        : " + col_risk(res.risk))
+    write("")
+
+    let risk_n: int = severity_score(res.risk)
+
+    let json: string = "[{\"ip\":\"" + target +
+        "\",\"risk\":\"" + res.risk +
+        "\",\"telnet\":" + if res.telnet then "true" else "false" end +
+        ",\"upnp\":"    + if res.upnp   then "true" else "false" end +
+        ",\"cves\":\""  + res.cves + "\"}]"
+
+    write("\x1b[2m──────────────────────────────────────────────────\x1b[0m")
+    write("  Znalezisk: " + to_string(findings) + "  |  ryzyko: " + to_string(risk_n) + "/100")
+    write("")
+
+    return ScanReport {
+        module:   "iot",
+        target:   target,
+        findings: findings,
+        risk:     risk_n,
+        json:     json,
+    }
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; MODULE: Web3
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn read_hex_file(path: string) -> bytes is
+    ;; io::read_bytes(path) gdy io module dostępny
+    ;; Na razie zwracamy przykładowy bytecode EVM do demonstracji
+    unsafe arena(64) is
+        ;; Przykładowy bytecode z: PUSH1 0x00, CALL, SSTORE, SELFDESTRUCT
+        let demo: bytes = b"\x60\x00\xF1\x55\xFF\x01\x01\x57\x32\x14\x57"
+        return demo
+    end
+end
+
+fn run_web3(source: string) -> ScanReport is
+    write("  \x1b[1;33m[Web3]\x1b[0m " + source)
+    write("  \x1b[2mAnaliza statyczna bytecode EVM — wzorce podatności\x1b[0m")
+    write("")
+
+    let bytecode: bytes  = read_hex_file(source)
+    let blen:     int    = bytes_len(bytecode)
+    write("  Bytecode  : " + to_string(blen) + " bajtów")
+    write("  Analiza   : Reentrancy · SELFDESTRUCT · tx.origin · overflow")
+    write("")
+
+    let findings: [proto::Web3Finding] = proto::analyze_bytecode(bytecode, blen)
+    let count:    int = array_len(findings)
+
+    let mut json:     string = "["
+    let mut risk_sum: int    = 0
+    let mut i:        int    = 0
+
+    while i < count is
+        let f: proto::Web3Finding = findings[i]
+        let sep: string = if i > 0 then "," else "" end
+
+        write("  " + col_risk(f.severity) + "  " + f.vuln +
+              "  @ " + fmt_offset(f.offset))
+        write("    Fix: " + f.fix)
+        write("")
+
+        risk_sum += severity_score(f.severity)
+        json = json + sep +
+               "{\"vuln\":\"" + f.vuln +
+               "\",\"severity\":\"" + f.severity +
+               "\",\"offset\":" + to_string(f.offset) + "}"
+        i += 1
+    end
+
+    json = json + "]"
+
+    let final_risk: int = if count > 0 then risk_sum / count else 0 end
+
+    write("\x1b[2m──────────────────────────────────────────────────\x1b[0m")
+    write("  Podatności: " + to_string(count) + "  |  ryzyko: " + to_string(final_risk) + "/100")
+    write("")
+
+    return ScanReport {
+        module:   "web3",
+        target:   source,
+        findings: count,
+        risk:     final_risk,
+        json:     json,
+    }
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; JSON output
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn print_json(r: ScanReport) is
+    write("")
+    write("  \x1b[2m── JSON ──────────────────────────────────────────\x1b[0m")
+    write("  {")
+    write("    \"module\":   \"" + r.module + "\",")
+    write("    \"target\":   \"" + r.target + "\",")
+    write("    \"findings\": " + to_string(r.findings) + ",")
+    write("    \"risk\":     " + to_string(r.risk) + ",")
+    write("    \"results\":  " + r.json)
+    write("  }")
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; Prosty parser argumentów CLI
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn arg_get(args: [string], argc: int, key: string) -> string is
+    ;; Szuka "--key=value" lub "--key value" w args
+    let prefix: string = "--" + key + "="
+    let mut i: int = 0
+    while i < argc is
+        if string_starts_with(args[i], prefix) is
+            return string_slice(args[i], string_len(prefix), string_len(args[i]))
+        end
+        if args[i] == "--" + key && i + 1 < argc is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn arg_flag(args: [string], argc: int, key: string) -> bool is
+    let mut i: int = 0
+    while i < argc is
+        if args[i] == "--" + key is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; MAIN
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn main() is
+    banner()
+
+    let args:  [string] = env::args()
+    let argc:  int      = array_len(args)
+
+    ;; Bez argumentów → tryb demo
+    if argc <= 1 is
+        write("  \x1b[2m[demo — uruchom z --module=scada/iot/web3]\x1b[0m")
+        write("")
+
+        write("  \x1b[1m══ Demo SCADA ══\x1b[0m")
+        let s: ScanReport = run_scada("192.168.100.50", false)
+        print_json(s)
+
+        write("")
+        write("  \x1b[1m══ Demo IoT ══\x1b[0m")
+        let io: ScanReport = run_iot("192.168.1.100", true)
+        print_json(io)
+
+        write("")
+        write("  \x1b[1m══ Demo Web3 ══\x1b[0m")
+        let w: ScanReport = run_web3("./demo_contract.hex")
+        print_json(w)
+
+        write("")
+        usage()
+        return
+    end
+
+    let module:     string = arg_get(args, argc, "module")
+    let target:     string = arg_get(args, argc, "target")
+    let source:     string = arg_get(args, argc, "source")
+    let aggressive: bool   = arg_flag(args, argc, "aggressive")
+    let all_ports:  bool   = arg_get(args, argc, "ports") == "all"
+    let json_out:   bool   = arg_flag(args, argc, "json")
+
+    if module == "" is
+        write("  \x1b[31merror:\x1b[0m --module wymagany")
+        write("")
+        usage()
+        exit(1)
+        return
+    end
+
+    let report: ScanReport = match module is
+        "scada" => is
+            if target == "" is
+                write("  \x1b[31merror:\x1b[0m --target wymagany dla modułu scada")
+                exit(1)
+            end
+            run_scada(target, all_ports)
+        end
+        "iot"   => is
+            if target == "" is
+                write("  \x1b[31merror:\x1b[0m --target wymagany dla modułu iot")
+                exit(1)
+            end
+            run_iot(target, aggressive)
+        end
+        "web3"  => is
+            let src: string = if source != "" then source else "./contract.hex" end
+            run_web3(src)
+        end
+        _ => is
+            write("  \x1b[31merror:\x1b[0m nieznany moduł '" + module + "'")
+            write("")
+            usage()
+            exit(1)
+            return ScanReport {
+                module: "", target: "", findings: 0, risk: 0, json: "[]"
+            }
+        end
+    end
+
+    if json_out is
+        print_json(report)
+    end
+end
