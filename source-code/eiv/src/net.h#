@@ -1,0 +1,161 @@
+extern dynamic [c] is
+    ;; Sockets
+    fn socket(domain: int, type_: int, proto: int) -> int
+    fn connect(fd: int, addr: bytes, addrlen: int) -> int
+    fn bind(fd: int, addr: bytes, addrlen: int) -> int
+    fn send(fd: int, buf: bytes, len: int, flags: int) -> int
+    fn recv(fd: int, buf: bytes, len: int, flags: int) -> int
+    fn sendto(fd: int, buf: bytes, len: int, flags: int, addr: bytes, addrlen: int) -> int
+    fn recvfrom(fd: int, buf: bytes, len: int, flags: int, addr: bytes, addrlen: int) -> int
+    fn close(fd: int) -> int
+    fn setsockopt(fd: int, level: int, optname: int, optval: bytes, optlen: int) -> int
+    fn fcntl(fd: int, cmd: int, arg: int) -> int
+    fn select(nfds: int, readfds: bytes, writefds: bytes, exceptfds: bytes, timeout: bytes) -> int
+
+    ;; Adresowanie
+    fn inet_pton(af: int, src: string, dst: bytes) -> int
+    fn htons(port: u16) -> u16
+    fn htonl(val: u32) -> u32
+    fn ntohs(val: u16) -> u16
+
+    ;; stdlib
+    fn memcpy(dst: bytes, src: bytes, n: int) -> bytes
+    fn memset(dst: bytes, c: int, n: int) -> bytes
+    fn memcmp(a: bytes, b: bytes, n: int) -> int
+    fn strerror(errnum: int) -> string
+end
+
+;; ── Stałe POSIX ───────────────────────────────────────────────────────────────
+
+fn AF_INET()    -> int is return 2   end
+fn SOCK_STREAM()-> int is return 1   end
+fn SOCK_DGRAM() -> int is return 2   end
+fn IPPROTO_TCP()-> int is return 6   end
+fn IPPROTO_UDP()-> int is return 17  end
+fn F_GETFL()    -> int is return 3   end
+fn F_SETFL()    -> int is return 4   end
+fn O_NONBLOCK() -> int is return 2048 end
+fn SOL_SOCKET() -> int is return 1   end
+fn SO_RCVTIMEO()-> int is return 20  end
+
+;; ── sockaddr_in builder (4 bajty IP + 2 bajty port) ─────────────────────────
+;; Layout: sin_family(2) + sin_port(2) + sin_addr(4) + padding(8) = 16 bajtów
+
+fn make_sockaddr(ip: string, port: u16) -> bytes is
+    unsafe arena(16) is
+        let mut addr: bytes = b"\x00" * 16
+        ;; sin_family = AF_INET = 2 (little-endian na x86)
+        addr[0] = 2
+        addr[1] = 0
+        ;; sin_port = htons(port)
+        let p: u16 = htons(port)
+        addr[2] = (p >> 8) & 0xFF
+        addr[3] = p & 0xFF
+        ;; sin_addr — inet_pton zapisuje 4 bajty pod offset 4
+        let ip_buf: bytes = b"\x00" * 4
+        inet_pton(AF_INET(), ip, ip_buf)
+        addr[4] = ip_buf[0]
+        addr[5] = ip_buf[1]
+        addr[6] = ip_buf[2]
+        addr[7] = ip_buf[3]
+        return addr
+    end
+end
+
+;; ── timeval builder (sec + usec) ──────────────────────────────────────────────
+
+fn make_timeval(sec: int, usec: int) -> bytes is
+    unsafe arena(16) is
+        let mut tv: bytes = b"\x00" * 16
+        ;; Uproszczone — tylko sekundy (wystarczy do timeoutów eiv)
+        tv[0] = sec & 0xFF
+        tv[1] = (sec >> 8) & 0xFF
+        return tv
+    end
+end
+
+;; ── TCP connect z timeout ─────────────────────────────────────────────────────
+
+fn tcp_connect(ip: string, port: u16, timeout_ms: int) -> int is
+    let fd: int = socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP())
+    if fd < 0 is
+        return -1
+    end
+
+    ;; Ustaw non-blocking
+    let flags: int = fcntl(fd, F_GETFL(), 0)
+    fcntl(fd, F_SETFL(), flags | O_NONBLOCK())
+
+    let addr: bytes = make_sockaddr(ip, port)
+    connect(fd, addr, 16)   ;; EINPROGRESS w trybie non-block — ignorujemy rc
+
+    ;; select() z timeoutem
+    unsafe arena(64) is
+        let mut wfds: bytes  = b"\x00" * 16
+        let tv:       bytes  = make_timeval(timeout_ms / 1000, (timeout_ms % 1000) * 1000)
+
+        ;; FD_SET(fd, &wfds) — bit fd w fd_set (8 bajtów na Linuxie)
+        let byte_idx: int = fd / 8
+        let bit_idx:  int = fd % 8
+        if byte_idx < 8 is
+            wfds[byte_idx] = wfds[byte_idx] | (1 << bit_idx)
+        end
+
+        let rc: int = select(fd + 1, b"\x00" * 16, wfds, b"\x00" * 16, tv)
+        if rc <= 0 is
+            close(fd)
+            return -1
+        end
+    end
+
+    ;; Przywróć blocking
+    let flags2: int = fcntl(fd, F_GETFL(), 0)
+    fcntl(fd, F_SETFL(), flags2 & (0xFFFF - O_NONBLOCK()))
+
+    return fd
+end
+
+;; ── TCP banner grab ───────────────────────────────────────────────────────────
+
+fn tcp_banner(ip: string, port: u16, timeout_ms: int) -> string is
+    let fd: int = tcp_connect(ip, port, timeout_ms)
+    if fd < 0 is
+        return ""
+    end
+
+    unsafe arena(1024) is
+        let buf: bytes = b"\x00" * 1024
+        let n:   int   = recv(fd, buf, 1023, 0)
+        close(fd)
+        if n > 0 is
+            return bytes_to_string(buf, n)
+        end
+        return ""
+    end
+end
+
+;; ── UDP send+recv ─────────────────────────────────────────────────────────────
+
+fn udp_probe(ip: string, port: u16, payload: bytes, plen: int, timeout_ms: int) -> int is
+    let fd: int = socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP())
+    if fd < 0 is return 0 end
+
+    let addr: bytes = make_sockaddr(ip, port)
+    sendto(fd, payload, plen, 0, addr, 16)
+
+    unsafe arena(256) is
+        let mut wfds: bytes = b"\x00" * 16
+        let tv:       bytes = make_timeval(timeout_ms / 1000, (timeout_ms % 1000) * 1000)
+
+        let byte_idx: int = fd / 8
+        let bit_idx:  int = fd % 8
+        if byte_idx < 8 is
+            wfds[byte_idx] = wfds[byte_idx] | (1 << bit_idx)
+        end
+
+        let mut rfds: bytes = wfds
+        let rc: int = select(fd + 1, rfds, b"\x00" * 16, b"\x00" * 16, tv)
+        close(fd)
+        return if rc > 0 then 1 else 0 end
+    end
+end
