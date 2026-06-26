@@ -1,0 +1,377 @@
+mod net
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; MODBUS TCP
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+;; Modbus TCP PDU: MBAP(6B) + FC(1B) + unit_id(1B) + addr(2B) + count(2B)
+fn modbus_make_pdu(unit_id: int) -> bytes is
+    unsafe arena(16) is
+        let mut pdu: bytes = b"\x00" * 12
+        ;; Transaction ID = 0x0001
+        pdu[0] = 0x00
+        pdu[1] = 0x01
+        ;; Protocol ID = 0x0000
+        pdu[2] = 0x00
+        pdu[3] = 0x00
+        ;; Length = 6
+        pdu[4] = 0x00
+        pdu[5] = 0x06
+        ;; Unit ID
+        pdu[6] = unit_id & 0xFF
+        ;; FC=03 Read Holding Registers
+        pdu[7] = 0x03
+        ;; Start address = 0x0000
+        pdu[8] = 0x00
+        pdu[9] = 0x00
+        ;; Quantity = 10
+        pdu[10] = 0x00
+        pdu[11] = 0x0A
+        return pdu
+    end
+end
+
+struct ModbusResult is
+    pub found:       bool
+    pub unit_id:     int
+    pub coil_count:  int
+    pub firmware:    string
+    pub risk:        string
+end
+
+fn modbus_scan(ip: string) -> ModbusResult is
+    let fd: int = net::tcp_connect(ip, 502, 2000)
+    if fd < 0 is
+        return ModbusResult {
+            found: false, unit_id: 0,
+            coil_count: 0, firmware: "", risk: "NONE"
+        }
+    end
+
+    let pdu: bytes = modbus_make_pdu(1)
+
+    unsafe arena(256) is
+        net::send(fd, pdu, 12, 0)
+        let buf: bytes = b"\x00" * 256
+        let n:   int   = net::recv(fd, buf, 255, 0)
+        net::close(fd)
+
+        if n >= 9 is
+            ;; Odpowiedź Modbus: buf[8] = byte_count
+            let coils: int = buf[8]
+            let risk: string = if coils > 100 then "CRITICAL"
+                               else if coils > 20 then "HIGH"
+                               else "MEDIUM" end end
+            return ModbusResult {
+                found:      true,
+                unit_id:    1,
+                coil_count: coils,
+                firmware:   "detected",
+                risk:       risk,
+            }
+        end
+
+        return ModbusResult {
+            found: false, unit_id: 0,
+            coil_count: 0, firmware: "", risk: "NONE"
+        }
+    end
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; BACnet/IP
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn bacnet_make_whois() -> bytes is
+    unsafe arena(8) is
+        ;; BVLC Original-Unicast + NPDU + APDU WHO-IS
+        let mut pkt: bytes = b"\x00" * 8
+        pkt[0] = 0x81   ;; BVLC Type
+        pkt[1] = 0x0B   ;; Original-Unicast-NPDU
+        pkt[2] = 0x00
+        pkt[3] = 0x08   ;; Length = 8
+        pkt[4] = 0x01   ;; NPDU version
+        pkt[5] = 0x04   ;; Control: expecting reply
+        pkt[6] = 0x10   ;; APDU: UnconfirmedRequest
+        pkt[7] = 0x08   ;; Service: Who-Is
+        return pkt
+    end
+end
+
+fn bacnet_scan(ip: string) -> bool is
+    let pkt: bytes = bacnet_make_whois()
+    return net::udp_probe(ip, 47808, pkt, 8, 1500) > 0
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; EtherNet/IP (CIP)
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn ethernetip_make_list_identity() -> bytes is
+    unsafe arena(24) is
+        let mut pkt: bytes = b"\x00" * 24
+        ;; EIP Encapsulation Header: ListIdentity (cmd=0x63)
+        pkt[0] = 0x63
+        pkt[1] = 0x00
+        ;; Pozostałe pola = 0 (session=0, status=0, context=0, options=0)
+        return pkt
+    end
+end
+
+fn ethernetip_scan(ip: string) -> bool is
+    let fd: int = net::tcp_connect(ip, 44818, 2000)
+    if fd < 0 is return false end
+
+    let pkt: bytes = ethernetip_make_list_identity()
+    unsafe arena(512) is
+        net::send(fd, pkt, 24, 0)
+        let buf: bytes = b"\x00" * 512
+        let n:   int   = net::recv(fd, buf, 511, 0)
+        net::close(fd)
+        ;; Odpowiedź > 24B z cmd=0x63 = urządzenie EtherNet/IP
+        return n > 24 && buf[0] == 0x63
+    end
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; PROFINET DCP
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn profinet_scan(ip: string) -> bool is
+    unsafe arena(8) is
+        ;; DCP Identify Request (uproszczony — przez UDP port 34964)
+        let pkt: bytes = b"\xfe\xfe\x05\x00\x00\x01\x00\x00"
+        return net::udp_probe(ip, 34964, pkt, 8, 1000) > 0
+    end
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; UPnP SSDP
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn upnp_msearch() -> bytes is
+    let msg: string = "M-SEARCH * HTTP/1.1\r\n" +
+                      "HOST: 239.255.255.250:1900\r\n" +
+                      "MAN: \"ssdp:discover\"\r\n" +
+                      "MX: 1\r\n" +
+                      "ST: ssdp:all\r\n\r\n"
+    return string_to_bytes(msg)
+end
+
+fn upnp_scan(ip: string) -> bool is
+    let pkt: bytes  = upnp_msearch()
+    let plen: int   = bytes_len(pkt)
+    return net::udp_probe(ip, 1900, pkt, plen, 1500) > 0
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; mDNS fingerprinting
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+fn mdns_make_query() -> bytes is
+    unsafe arena(48) is
+        ;; PTR query: _services._dns-sd._udp.local
+        let mut q: bytes = b"\x00" * 47
+        ;; Header: ID=0, Flags=0x0000, QDCOUNT=1
+        q[4] = 0x00
+        q[5] = 0x01
+        ;; QNAME: 9+'_services' 7+'_dns-sd' 4+'_udp' 5+'local' 0
+        q[12] = 9
+        q[13] = 0x5F  ;; '_'
+        q[14] = 0x73  ;; 's'
+        q[15] = 0x65  ;; 'e'
+        q[16] = 0x72  ;; 'r'
+        q[17] = 0x76  ;; 'v'
+        q[18] = 0x69  ;; 'i'
+        q[19] = 0x63  ;; 'c'
+        q[20] = 0x65  ;; 'e'
+        q[21] = 0x73  ;; 's'
+        ;; QTYPE=PTR(12), QCLASS=IN+unicast(0x8001)
+        q[43] = 0x00
+        q[44] = 0x0C
+        q[45] = 0x80
+        q[46] = 0x01
+        return q
+    end
+end
+
+fn mdns_probe(ip: string) -> bool is
+    let q: bytes  = mdns_make_query()
+    let n: int    = bytes_len(q)
+    return net::udp_probe(ip, 5353, q, n, 1000) > 0
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════════
+;; EVM bytecode analysis (w czystym H#)
+;; ═══════════════════════════════════════════════════════════════════════════════
+
+;; Opcody EVM
+fn OP_CALL()        -> u8 is return 0xF1 end
+fn OP_DELEGATECALL()-> u8 is return 0xF4 end
+fn OP_SELFDESTRUCT()-> u8 is return 0xFF end
+fn OP_SSTORE()      -> u8 is return 0x55 end
+fn OP_JUMPI()       -> u8 is return 0x57 end
+fn OP_ORIGIN()      -> u8 is return 0x32 end
+fn OP_EQ()          -> u8 is return 0x14 end
+fn OP_ADD()         -> u8 is return 0x01 end
+fn OP_MUL()         -> u8 is return 0x02 end
+
+struct Web3Finding is
+    pub vuln:     string
+    pub severity: string
+    pub offset:   int
+    pub fix:      string
+end
+
+;; Zwraca rozmiar PUSH (1 + n bajtów danych) lub 1 dla innych
+fn evm_skip(bytecode: bytes, i: int) -> int is
+    let op: u8 = bytecode[i]
+    if op >= 0x60 && op <= 0x7F is
+        return 1 + (op - 0x5F)
+    end
+    return 1
+end
+
+fn evm_find_reentrancy(bytecode: bytes, n: int) -> Maybe<int> is
+    let mut i: int = 0
+    while i < n is
+        if bytecode[i] == OP_CALL() is
+            ;; Szukaj SSTORE w oknie 64 bajtów po CALL
+            let limit: int = if i + 64 < n then i + 64 else n end
+            let mut j: int = i + 1
+            while j < limit is
+                if bytecode[j] == OP_SSTORE() is
+                    return Maybe::Some(i)
+                end
+                if bytecode[j] == OP_CALL() is
+                    break   ;; inny blok
+                end
+                j += evm_skip(bytecode, j)
+            end
+        end
+        i += evm_skip(bytecode, i)
+    end
+    return Maybe::None
+end
+
+fn evm_find_selfdestruct(bytecode: bytes, n: int) -> Maybe<int> is
+    let mut i: int = 0
+    while i < n is
+        if bytecode[i] == OP_SELFDESTRUCT() is
+            ;; Sprawdź czy w poprzednich 32 bajtach jest JUMPI (guard)
+            let look_back: int = if i > 32 then i - 32 else 0 end
+            let mut guarded: bool = false
+            let mut k: int = look_back
+            while k < i is
+                if bytecode[k] == OP_JUMPI() is
+                    guarded = true
+                    break
+                end
+                k += 1
+            end
+            if !guarded is
+                return Maybe::Some(i)
+            end
+        end
+        i += evm_skip(bytecode, i)
+    end
+    return Maybe::None
+end
+
+fn evm_find_tx_origin(bytecode: bytes, n: int) -> Maybe<int> is
+    let mut i: int = 0
+    while i + 3 < n is
+        if bytecode[i] == OP_ORIGIN() is
+            ;; ORIGIN + EQ + JUMPI w oknie 8 bajtów = tx.origin auth
+            let limit: int = if i + 8 < n then i + 8 else n end
+            let mut has_eq:    bool = false
+            let mut has_jumpi: bool = false
+            let mut j: int = i + 1
+            while j < limit is
+                if bytecode[j] == OP_EQ()    is has_eq    = true end
+                if bytecode[j] == OP_JUMPI() is has_jumpi = true end
+                j += 1
+            end
+            if has_eq && has_jumpi is
+                return Maybe::Some(i)
+            end
+        end
+        i += evm_skip(bytecode, i)
+    end
+    return Maybe::None
+end
+
+fn evm_find_overflow(bytecode: bytes, n: int) -> Maybe<int> is
+    let mut arith: int = 0
+    let mut guards: int = 0
+    let mut first_arith: int = -1
+    let mut i: int = 0
+    while i < n is
+        let op: u8 = bytecode[i]
+        if op == OP_ADD() || op == OP_MUL() is
+            arith += 1
+            if first_arith < 0 is first_arith = i end
+        end
+        if op == OP_JUMPI() is guards += 1 end
+        i += evm_skip(bytecode, i)
+    end
+    ;; Więcej arytmetyki niż guardów = brak SafeMath
+    if arith > 3 && arith > guards * 2 is
+        return Maybe::Some(first_arith)
+    end
+    return Maybe::None
+end
+
+fn analyze_bytecode(bytecode: bytes, n: int) -> [Web3Finding] is
+    let mut findings: [Web3Finding] = []
+
+    match evm_find_reentrancy(bytecode, n) is
+        Maybe::Some(off) => is
+            findings = findings + [Web3Finding {
+                vuln:     "Reentrancy",
+                severity: "CRITICAL",
+                offset:   off,
+                fix:      "Użyj wzorca Checks-Effects-Interactions",
+            }]
+        end
+        Maybe::None => is end
+    end
+
+    match evm_find_selfdestruct(bytecode, n) is
+        Maybe::Some(off) => is
+            findings = findings + [Web3Finding {
+                vuln:     "UnprotectedSelfDestruct",
+                severity: "CRITICAL",
+                offset:   off,
+                fix:      "Dodaj modifier onlyOwner",
+            }]
+        end
+        Maybe::None => is end
+    end
+
+    match evm_find_tx_origin(bytecode, n) is
+        Maybe::Some(off) => is
+            findings = findings + [Web3Finding {
+                vuln:     "TxOriginAuth",
+                severity: "MEDIUM",
+                offset:   off,
+                fix:      "Zastąp tx.origin przez msg.sender",
+            }]
+        end
+        Maybe::None => is end
+    end
+
+    match evm_find_overflow(bytecode, n) is
+        Maybe::Some(off) => is
+            findings = findings + [Web3Finding {
+                vuln:     "IntegerOverflow",
+                severity: "HIGH",
+                offset:   off,
+                fix:      "Użyj SafeMath lub Solidity >= 0.8",
+            }]
+        end
+        Maybe::None => is end
+    end
+
+    return findings
+end
