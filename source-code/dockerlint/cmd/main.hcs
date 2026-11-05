@@ -1,0 +1,254 @@
+using <0.6>
+get <std:string> import <str_trim::str_split::str_contains::str_starts_with::str_replace::str_join::str_repeat::str_to_int::str_ends_with::str_to_float::str_index_of>
+get <std:io> import <read_file_or::write_file_ok::file_readable>
+get <std:fs> import <list_dir_or_empty::create_dir_ok>
+
+!! ── cybersec prelude (HackerScript) — shared helpers, 0.2 ───────────────────
+!! Authorised testing only: run these tools against systems you own or are
+!! explicitly permitted to assess.
+
+!! always succeeds at the run_command level (so a non-zero exit inside
+!! `cmd`, e.g. a `grep` with no match, never turns into a silent Err /
+!! empty string) — the real exit status is not needed by these tools,
+!! which only look at stdout text.
+fun sh(cmd: Str) -> Str [
+    match run_command("/bin/sh".to_string(), ["-c".to_string(), cmd + "; true"]) [
+        Ok(o) -> [ end str_trim(o) ]
+        Err(_e) -> [ end "" ]
+    ]
+]
+
+fun have_cmd(name: Str) -> Bool [
+    end command_ok(name)
+]
+
+fun command_ok(name: Str) -> Bool [
+    end sh("command -v " + sh_quote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+]
+
+fun sh_quote(s: Str) -> Str [
+    end "'" + str_replace(s, "'", "'\\''") + "'"
+]
+
+fun arg_has(args: List<Str>, flag: Str) -> Bool [
+    let i = 0
+    let n = args.len()
+    while i < n [
+        if args[i] == flag [
+            end true
+        ]
+        i = i + 1
+    ]
+    end false
+]
+
+fun arg_val(args: List<Str>, key: Str, dflt: Str) -> Str [
+    let pre: Str = key + "="
+    let i = 0
+    let n = args.len()
+    while i < n [
+        let a: Str = args[i].clone()
+        if str_starts_with(a.clone(), pre.clone()) [
+            end a.slice(pre.len(), a.len())
+        ]
+        if a == key and i + 1 < n [
+            end args[i + 1].clone()
+        ]
+        i = i + 1
+    ]
+    end dflt
+]
+
+fun positional(args: List<Str>, n: Int) -> Str [
+    let seen = 0
+    let i = 0
+    let total = args.len()
+    while i < total [
+        let a: Str = args[i].clone()
+        if not str_starts_with(a.clone(), "-") [
+            seen = seen + 1
+            if seen == n [
+                end a
+            ]
+        ]
+        i = i + 1
+    ]
+    end ""
+]
+
+fun c_cyan(s: Str) -> Str [ end "\e[36m" + s + "\e[0m" ]
+fun c_green(s: Str) -> Str [ end "\e[32m" + s + "\e[0m" ]
+fun c_yellow(s: Str) -> Str [ end "\e[33m" + s + "\e[0m" ]
+fun c_red(s: Str) -> Str [ end "\e[31m" + s + "\e[0m" ]
+fun c_dim(s: Str) -> Str [ end "\e[2m" + s + "\e[0m" ]
+fun c_bold(s: Str) -> Str [ end "\e[1m" + s + "\e[0m" ]
+
+fun banner(name: Str, ver: Str, desc: Str) [
+    log("")
+    log(c_cyan("  | " + name) + c_dim("  v" + ver + "  -  " + desc))
+    log(c_dim("  " + str_repeat("-", 58)))
+]
+
+fun ok_line(msg: Str) -> Int [
+    log("  " + c_green("PASS") + "  " + msg)
+    end 0
+]
+
+fun warn_line(msg: Str) -> Int [
+    log("  " + c_yellow("WARN") + "  " + msg)
+    end 1
+]
+
+fun bad_line(msg: Str) -> Int [
+    log("  " + c_red("FAIL") + "  " + msg)
+    end 2
+]
+
+fun info_line(msg: Str) [
+    log("  " + c_cyan("INFO") + "  " + msg)
+]
+
+fun pad_right(s: Str, width: Int) -> Str [
+    let out: Str = s.clone()
+    while out.len() < width [
+        out = out + " "
+    ]
+    end out
+]
+
+fun summary(tool: Str, checks: Int, warns: Int, fails: Int) -> Int [
+    log(c_dim("  " + str_repeat("-", 58)))
+    let line = tool + ": " + checks.to_string() + " checks, " + warns.to_string() + " warnings, " + fails.to_string() + " failures"
+    if fails > 0 [
+        log("  " + c_red(line))
+        end 2
+    ]
+    if warns > 0 [
+        log("  " + c_yellow(line))
+        end 1
+    ]
+    log("  " + c_green(line))
+    end 0
+]
+
+fun home_dir() -> Str [
+    match env_var("HOME") [
+        Some(v) -> [ end v ]
+        None -> [ end "/root" ]
+    ]
+]
+
+fun state_dir(tool: Str) -> Str [
+    let d = home_dir() + "/.hackeros/" + tool
+    sh("mkdir -p " + sh_quote(d))
+    end d
+]
+
+fun opt_int_or(o: Option<Int>, dflt: Int) -> Int [
+    match o [
+        Some(v) -> [ end v ]
+        None -> [ end dflt ]
+    ]
+]
+
+fun arg_int(args: List<Str>, key: Str, dflt: Int) -> Int [
+    end opt_int_or(str_to_int(arg_val(args, key, dflt.to_string())), dflt)
+]
+
+!! dockerlint — Dockerfile security & best-practice linter
+!! Usage: dockerlint <Dockerfile>
+
+fun main() [
+    let a = args()
+    let path = positional(a, 1)
+    if path == "" or arg_has(a, "--help") [
+        banner("dockerlint", "0.2.0", "Dockerfile security linter")
+        log("  dockerlint <Dockerfile>")
+        end
+    ]
+    if not file_readable(path) [
+        log(c_red("error:") + " cannot read " + path)
+        exit(1)
+    ]
+    banner("dockerlint", "0.2.0", path)
+    let text = read_file_or(path, "")
+    let lines = str_split(text, "\n")
+    let checks = 0
+    let warns = 0
+    let fails = 0
+
+    checks = checks + 1
+    if str_contains(text, ":latest") or (str_contains(text, "FROM ") and not str_contains(text, ":")) [
+        warns = warns + 1
+        warn_line("FROM uses :latest (or no tag) — pin a specific, immutable base image tag/digest")
+    ] else [
+        ok_line("base image appears pinned")
+    ]
+
+    checks = checks + 1
+    if str_contains(text, "\nUSER ") or str_starts_with(text, "USER ") [
+        ok_line("USER directive present (not running as root)")
+    ] else [
+        fails = fails + 1
+        bad_line("no USER directive — container will run as root by default")
+    ]
+
+    checks = checks + 1
+    if str_contains(text, "ADD http") or str_contains(text, "ADD ftp") [
+        warns = warns + 1
+        warn_line("ADD fetches a remote URL directly — prefer curl/wget + checksum verification, or COPY")
+    ] else [
+        ok_line("no remote-URL ADD instructions")
+    ]
+
+    checks = checks + 1
+    let secret_pat = "(PASSWORD|SECRET|API_KEY|TOKEN|AWS_ACCESS_KEY)[[:space:]]*="
+    let hit = sh("grep -inE " + sh_quote(secret_pat) + " " + sh_quote(path) + " | head -5")
+    if str_trim(hit) != "" [
+        fails = fails + 1
+        bad_line("possible hard-coded secret in ENV/ARG:")
+        log(sh("printf %s " + sh_quote(hit) + " | sed 's/^/    /'"))
+    ] else [
+        ok_line("no obvious hard-coded secrets in ENV/ARG")
+    ]
+
+    checks = checks + 1
+    let run_count = sh("grep -c '^RUN ' " + sh_quote(path))
+    match str_to_int(run_count) [
+        Some(v) -> [
+            if v > 8 [
+                warns = warns + 1
+                warn_line(v.to_string() + " separate RUN layers — consider chaining with && to shrink the image")
+            ] else [
+                ok_line(v.to_string() + " RUN layer(s)")
+            ]
+        ]
+        None -> [ ]
+    ]
+
+    checks = checks + 1
+    if str_contains(text, "apt-get install") and not str_contains(text, "--no-install-recommends") [
+        warns = warns + 1
+        warn_line("apt-get install without --no-install-recommends pulls extra packages")
+    ] else [
+        ok_line("no bloated apt-get install detected")
+    ]
+
+    checks = checks + 1
+    if str_contains(text, "chmod 777") or str_contains(text, "chmod -R 777") [
+        fails = fails + 1
+        bad_line("chmod 777 found — overly permissive filesystem mode")
+    ] else [
+        ok_line("no chmod 777 found")
+    ]
+
+    checks = checks + 1
+    if str_contains(text, "HEALTHCHECK") [
+        ok_line("HEALTHCHECK defined")
+    ] else [
+        warns = warns + 1
+        warn_line("no HEALTHCHECK instruction")
+    ]
+
+    exit(summary("dockerlint", checks, warns, fails))
+]
