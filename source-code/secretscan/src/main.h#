@@ -1,0 +1,203 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; secretscan — find leaked credentials in a source tree (defensive, values are masked)
+;; Usage: secretscan <dir> [--all] [--include-git]
+
+fn usage() is
+    banner("secretscan", "0.2.0", "secret & credential leak finder")
+    write("  secretscan <dir> [--include-git]   scan a directory tree; matches are masked")
+end
+
+;; name|ERE
+fn rules() -> [string] is
+    return [
+        "AWS access key id|AKIA[0-9A-Z]{{16}}",
+        "AWS secret key|aws_secret_access_key[[:space:]]*[=:][[:space:]]*['\"]?[A-Za-z0-9/+=]{{40}}",
+        "Private key block|-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY",
+        "GitHub token|gh[pousr]_[A-Za-z0-9]{{36,}}",
+        "Slack token|xox[baprs]-[A-Za-z0-9-]{{10,}}",
+        "Google API key|AIza[0-9A-Za-z_-]{{35}}",
+        "Stripe live key|sk_live_[0-9a-zA-Z]{{24,}}",
+        "JWT|eyJ[A-Za-z0-9_-]{{10,}}\\.eyJ[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}",
+        "Generic password assignment|(password|passwd|pwd|secret|api[_-]?key|token)[[:space:]]*[=:][[:space:]]*['\"][^'\" ]{{8,}}['\"]",
+        "Basic-auth URL|[a-z]+://[^/[:space:]:@]+:[^/[:space:]@]+@[a-z0-9.-]+"
+    ]
+end
+
+fn mask(s: string) -> string is
+    let n: int = string_len(s)
+    if n <= 8 is
+        return "****"
+    end
+    return string_slice(s, 0, 4) + string_repeat("*", 8) + string_slice(s, n - 2, n)
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let dir: string = positional(args, 1)
+    if dir == "" || !fs_exists(dir) is
+        usage()
+        exit(1)
+    end
+    banner("secretscan", "0.2.0", dir)
+    let mut excl: string = "--exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=target"
+    if !arg_has(args, "--include-git") is
+        excl = excl + " --exclude-dir=.git"
+    end
+    let rs: [string] = rules()
+    let mut hits: int = 0
+    let mut i: int = 0
+    while i < array_len(rs) is
+        let parts: [string] = split(rs[i], "|")
+        let name: string = parts[0]
+        let ere: string = string_slice(rs[i], string_len(name) + 1, string_len(rs[i]))
+        let out: string = shell("grep -rIEn " + excl + " -e " + shquote(ere) + " " + shquote(dir) + " 2>/dev/null | head -50")
+        if string_len(trim(out)) > 0 is
+            let rows: [string] = split(trim(out), "\n")
+            let mut j: int = 0
+            while j < array_len(rows) is
+                let r: [string] = split(rows[j], ":")
+                let loc: string = r[0] + ":" + (if array_len(r) > 1 then r[1] else "?" end)
+                let m: string = sh("printf %s " + shquote(rows[j]) + " | grep -oE -e " + shquote(ere) + " | head -1")
+                write("  " + red_text(string_pad_right(name, 28)) + loc + dim_text("  " + mask(m)))
+                hits += 1
+                j += 1
+            end
+        end
+        i += 1
+    end
+    write(dim_text("  " + string_repeat("─", 58)))
+    if hits == 0 is
+        write("  " + green_text("no secrets matched"))
+        return
+    end
+    write("  " + red_text(to_string(hits) + " potential secret(s)") + dim_text(" — rotate them, then remove from history"))
+    exit(2)
+end
