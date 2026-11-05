@@ -1,1 +1,258 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
 
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; cybersecurity-cli (csec) — master launcher for every HackerOS cybersecurity tool
+;; Usage: csec [list|info <tool>|<tool> [args...]]
+
+fn registry() -> [string] is
+    return [
+        "hashkit|hash & crypto toolkit (hash, hmac, verify, entropy, id)|H#",
+        "rip|IPv4 / CIDR calculator and DNS helper|H#",
+        "hct|containerised tool manager (metasploit, nmap, kali, ...)|H#",
+        "portwatch|TCP port scanner with baseline diff|H#",
+        "tlscheck|TLS certificate & protocol audit|H#",
+        "hdrcheck|HTTP security header & cookie audit|H#",
+        "fim|file integrity monitor (SHA-256 manifests)|H#",
+        "logsift|SSH & web access log analyzer|H#",
+        "sshaudit|sshd hardening audit|H#",
+        "secretscan|leaked-credential scanner (masked output)|H#",
+        "sysharden|Linux kernel/network/account hardening audit|H#",
+        "jam|Wi-Fi deauth-flood DETECTOR (defensive)|H#",
+        "bph|containerised pentest lab (Kali/BlackArch) + own-tools|H#",
+        "eic|kernel installer / variant matcher (chker)|H#",
+        "eiq|CPU microarchitecture → kernel variant matcher|H#",
+        "eiv|SCADA / IoT / Web3 recon scanner|H#",
+        "netwatch|live connection & listening-socket watchdog|H#",
+        "wificheck|Wi-Fi/AP configuration sanity checker|H#",
+        "phishcheck|URL & email phishing heuristics checker|H#",
+        "cveradar|local package inventory vs OSV.dev advisories|HackerScript",
+        "walldesign|nftables firewall ruleset generator & linter|HackerScript",
+        "passforge|policy-driven password/passphrase generator & checker|HackerScript",
+        "dnsshield|DNS-over-HTTPS resolver + blocklist checker|HackerScript",
+        "cryptolab|symmetric encrypt/decrypt lab (AES-GCM via OpenSSL)|HackerScript",
+        "netmap|LAN host discovery & service sketch (ARP + TCP)|HackerScript",
+        "ratrace|process & autostart anomaly hunter|HackerScript",
+        "backupaudit|backup existence/age/encryption auditor|HackerScript",
+        "licwatch|open-source license & SBOM summarizer|HackerScript",
+        "pcapstat|single-file packet capture statistics (Hacker Lang)|HackerLang",
+        "zipbomb-check|archive expansion-ratio / zip-bomb detector (Hacker Lang)|HackerLang"
+    ]
+end
+
+fn lang_tag(lang: string) -> string is
+    if lang == "H#" is return cyan_text("[H#]") end
+    if lang == "HackerScript" is return yellow_text("[HS]") end
+    return "\x1b[35m[HL]\x1b[0m"
+end
+
+fn find(name: string) -> [string] is
+    let reg: [string] = registry()
+    let mut i: int = 0
+    while i < array_len(reg) is
+        let f: [string] = split(reg[i], "|")
+        if f[0] == name is
+            return f
+        end
+        i += 1
+    end
+    return []
+end
+
+fn usage() is
+    banner("csec", "0.2.0", "HackerOS cybersecurity-tools launcher")
+    write("  csec list                tools in this suite, grouped by language")
+    write("  csec info <tool>         one-line description")
+    write("  csec <tool> [args...]    run a tool (looked up on PATH as csec-<tool> or <tool>)")
+    write(dim_text("  Suite mix: H# ~50% · HackerScript ~40% · Hacker Lang ~10% (single-file tools)"))
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || cmd == "help" || cmd == "--help" is
+        usage()
+        return
+    end
+    if cmd == "list" is
+        banner("csec list", "0.2.0", to_string(array_len(registry())) + " tools")
+        let reg: [string] = registry()
+        let mut i: int = 0
+        while i < array_len(reg) is
+            let f: [string] = split(reg[i], "|")
+            write("  " + lang_tag(f[2]) + " " + bold(string_pad_right(f[0], 16)) + f[1])
+            i += 1
+        end
+        return
+    end
+    if cmd == "info" is
+        let f: [string] = find(positional(args, 2))
+        if array_len(f) == 0 is
+            write(red_text("error:") + " unknown tool")
+            exit(1)
+        end
+        write(bold(f[0]) + "  " + lang_tag(f[2]))
+        write("  " + f[1])
+        return
+    end
+    let f: [string] = find(cmd)
+    if array_len(f) == 0 is
+        write(red_text("error:") + " unknown tool or command '" + cmd + "' — see: csec list")
+        exit(1)
+    end
+    if !have_cmd(cmd) is
+        write(red_text("error:") + " '" + cmd + "' is not installed / not on PATH")
+        exit(1)
+    end
+    let rest: [string] = tool_tail(args)
+    exit(exec_passthru(cmd, rest))
+end
+
+fn tool_tail(args: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 2
+    while i < array_len(args) is
+        out = array_push(out, args[i])
+        i += 1
+    end
+    return out
+end
+
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+fn exec_passthru(tool: string, rest: [string]) -> int is
+    let mut line: string = shquote(tool)
+    let mut i: int = 0
+    while i < array_len(rest) is
+        line = line + " " + shquote(rest[i])
+        i += 1
+    end
+    return system(line)
+end
