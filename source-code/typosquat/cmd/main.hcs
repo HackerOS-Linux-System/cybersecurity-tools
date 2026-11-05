@@ -1,0 +1,299 @@
+using <0.6>
+get <std:string> import <str_trim::str_split::str_contains::str_starts_with::str_replace::str_join::str_repeat::str_to_int::str_ends_with::str_to_float::str_index_of>
+get <std:io> import <read_file_or::write_file_ok::file_readable>
+get <std:fs> import <list_dir_or_empty::create_dir_ok>
+
+!! ── cybersec prelude (HackerScript) — shared helpers, 0.2 ───────────────────
+!! Authorised testing only: run these tools against systems you own or are
+!! explicitly permitted to assess.
+
+!! always succeeds at the run_command level (so a non-zero exit inside
+!! `cmd`, e.g. a `grep` with no match, never turns into a silent Err /
+!! empty string) — the real exit status is not needed by these tools,
+!! which only look at stdout text.
+fun sh(cmd: Str) -> Str [
+    match run_command("/bin/sh".to_string(), ["-c".to_string(), cmd + "; true"]) [
+        Ok(o) -> [ end str_trim(o) ]
+        Err(_e) -> [ end "" ]
+    ]
+]
+
+fun have_cmd(name: Str) -> Bool [
+    end command_ok(name)
+]
+
+fun command_ok(name: Str) -> Bool [
+    end sh("command -v " + sh_quote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+]
+
+fun sh_quote(s: Str) -> Str [
+    end "'" + str_replace(s, "'", "'\\''") + "'"
+]
+
+fun arg_has(args: List<Str>, flag: Str) -> Bool [
+    let i = 0
+    let n = args.len()
+    while i < n [
+        if args[i] == flag [
+            end true
+        ]
+        i = i + 1
+    ]
+    end false
+]
+
+fun arg_val(args: List<Str>, key: Str, dflt: Str) -> Str [
+    let pre: Str = key + "="
+    let i = 0
+    let n = args.len()
+    while i < n [
+        let a: Str = args[i].clone()
+        if str_starts_with(a.clone(), pre.clone()) [
+            end a.slice(pre.len(), a.len())
+        ]
+        if a == key and i + 1 < n [
+            end args[i + 1].clone()
+        ]
+        i = i + 1
+    ]
+    end dflt
+]
+
+fun positional(args: List<Str>, n: Int) -> Str [
+    let seen = 0
+    let i = 0
+    let total = args.len()
+    while i < total [
+        let a: Str = args[i].clone()
+        if not str_starts_with(a.clone(), "-") [
+            seen = seen + 1
+            if seen == n [
+                end a
+            ]
+        ]
+        i = i + 1
+    ]
+    end ""
+]
+
+fun c_cyan(s: Str) -> Str [ end "\e[36m" + s + "\e[0m" ]
+fun c_green(s: Str) -> Str [ end "\e[32m" + s + "\e[0m" ]
+fun c_yellow(s: Str) -> Str [ end "\e[33m" + s + "\e[0m" ]
+fun c_red(s: Str) -> Str [ end "\e[31m" + s + "\e[0m" ]
+fun c_dim(s: Str) -> Str [ end "\e[2m" + s + "\e[0m" ]
+fun c_bold(s: Str) -> Str [ end "\e[1m" + s + "\e[0m" ]
+
+fun banner(name: Str, ver: Str, desc: Str) [
+    log("")
+    log(c_cyan("  | " + name) + c_dim("  v" + ver + "  -  " + desc))
+    log(c_dim("  " + str_repeat("-", 58)))
+]
+
+fun ok_line(msg: Str) -> Int [
+    log("  " + c_green("PASS") + "  " + msg)
+    end 0
+]
+
+fun warn_line(msg: Str) -> Int [
+    log("  " + c_yellow("WARN") + "  " + msg)
+    end 1
+]
+
+fun bad_line(msg: Str) -> Int [
+    log("  " + c_red("FAIL") + "  " + msg)
+    end 2
+]
+
+fun info_line(msg: Str) [
+    log("  " + c_cyan("INFO") + "  " + msg)
+]
+
+fun pad_right(s: Str, width: Int) -> Str [
+    let out: Str = s.clone()
+    while out.len() < width [
+        out = out + " "
+    ]
+    end out
+]
+
+fun summary(tool: Str, checks: Int, warns: Int, fails: Int) -> Int [
+    log(c_dim("  " + str_repeat("-", 58)))
+    let line = tool + ": " + checks.to_string() + " checks, " + warns.to_string() + " warnings, " + fails.to_string() + " failures"
+    if fails > 0 [
+        log("  " + c_red(line))
+        end 2
+    ]
+    if warns > 0 [
+        log("  " + c_yellow(line))
+        end 1
+    ]
+    log("  " + c_green(line))
+    end 0
+]
+
+fun home_dir() -> Str [
+    match env_var("HOME") [
+        Some(v) -> [ end v ]
+        None -> [ end "/root" ]
+    ]
+]
+
+fun state_dir(tool: Str) -> Str [
+    let d = home_dir() + "/.hackeros/" + tool
+    sh("mkdir -p " + sh_quote(d))
+    end d
+]
+
+fun opt_int_or(o: Option<Int>, dflt: Int) -> Int [
+    match o [
+        Some(v) -> [ end v ]
+        None -> [ end dflt ]
+    ]
+]
+
+fun arg_int(args: List<Str>, key: Str, dflt: Int) -> Int [
+    end opt_int_or(str_to_int(arg_val(args, key, dflt.to_string())), dflt)
+]
+
+!! typosquat — generates plausible typosquat variants of a domain (defensive monitoring)
+!! and optionally checks which ones currently resolve.
+!! Usage: typosquat gen <domain> | typosquat check <domain>
+
+fun keyboard_neighbors(c: Str) -> List<Str> [
+    if c == "a" [ end ["q", "s", "z"] ]
+    if c == "e" [ end ["w", "r", "d"] ]
+    if c == "i" [ end ["u", "o", "k"] ]
+    if c == "o" [ end ["i", "p", "l"] ]
+    if c == "n" [ end ["b", "m", "h"] ]
+    if c == "m" [ end ["n", "j", "k"] ]
+    end []
+]
+
+fun swap_adjacent(s: Str) -> List<Str> [
+    let out: List<Str> = []
+    let n = s.len()
+    let i = 0
+    while i < n - 1 [
+        let v = s.slice(0, i) + s.slice(i + 1, i + 2) + s.slice(i, i + 1) + s.slice(i + 2, n)
+        out.push(v)
+        i = i + 1
+    ]
+    end out
+]
+
+fun drop_each(s: Str) -> List<Str> [
+    let out: List<Str> = []
+    let n = s.len()
+    let i = 0
+    while i < n [
+        out.push(s.slice(0, i) + s.slice(i + 1, n))
+        i = i + 1
+    ]
+    end out
+]
+
+fun double_each(s: Str) -> List<Str> [
+    let out: List<Str> = []
+    let n = s.len()
+    let i = 0
+    while i < n [
+        let ch = s.slice(i, i + 1)
+        out.push(s.slice(0, i + 1) + ch + s.slice(i + 1, n))
+        i = i + 1
+    ]
+    end out
+]
+
+fun homoglyphs(s: Str) -> List<Str> [
+    let out: List<Str> = []
+    if str_contains(s, "o") [ out.push(str_replace(s.clone(), "o", "0")) ]
+    if str_contains(s, "l") [ out.push(str_replace(s.clone(), "l", "1")) ]
+    if str_contains(s, "i") [ out.push(str_replace(s.clone(), "i", "1")) ]
+    if str_contains(s, "e") [ out.push(str_replace(s.clone(), "e", "3")) ]
+    if str_contains(s, "s") [ out.push(str_replace(s.clone(), "s", "5")) ]
+    end out
+]
+
+fun add_variants(acc: List<Str>, grp: List<Str>, rest: Str) [
+    let j = 0
+    let jn = grp.len()
+    while j < jn [
+        let piece: Str = grp[j].clone()
+        let suffix: Str = rest.clone()
+        acc.push(piece + suffix)
+        j = j + 1
+    ]
+]
+
+fun generate(domain: Str) -> List<Str> [
+    let parts = str_split(domain, ".")
+    let name: Str = parts[0].clone()
+    let rest: Str = ""
+    let i = 1
+    let n = parts.len()
+    while i < n [
+        rest = rest + "." + parts[i].clone()
+        i = i + 1
+    ]
+    let variants: List<Str> = []
+    let g1 = swap_adjacent(name.clone())
+    let g2 = drop_each(name.clone())
+    let g3 = double_each(name.clone())
+    let g4 = homoglyphs(name.clone())
+    add_variants(variants, g1, rest.clone())
+    add_variants(variants, g2, rest.clone())
+    add_variants(variants, g3, rest.clone())
+    add_variants(variants, g4, rest.clone())
+    !! common TLD confusables
+    variants.push(name.clone() + ".cm")
+    variants.push(name.clone() + ".co")
+    variants.push(name.clone() + "-" + "security" + rest.clone())
+    end variants
+]
+
+fun usage() [
+    banner("typosquat", "0.2.0", "typosquat domain variant generator / checker")
+    log("  typosquat gen <domain>      list plausible lookalike domains")
+    log("  typosquat check <domain>    list variants that currently resolve (possible squatters)")
+]
+
+fun main() [
+    let a = args()
+    let cmd = positional(a, 1)
+    let domain = positional(a, 2)
+    if cmd == "" or domain == "" or arg_has(a, "--help") [
+        usage()
+        end
+    ]
+    let variants = generate(domain)
+    if cmd == "gen" [
+        banner("typosquat gen", "0.2.0", domain + "  (" + variants.len().to_string() + " variants)")
+        let i = 0
+        let n = variants.len()
+        while i < n [
+            log("  " + variants[i].clone())
+            i = i + 1
+        ]
+        end
+    ]
+    if cmd == "check" [
+        banner("typosquat check", "0.2.0", domain)
+        let i = 0
+        let n = variants.len()
+        let hits = 0
+        while i < n [
+            let v: Str = variants[i].clone()
+            let ip = sh("getent ahosts " + sh_quote(v) + " 2>/dev/null | awk '{print $1}' | head -1")
+            if ip != "" [
+                log("  " + c_yellow("RESOLVES") + "  " + pad_right(v, 28) + "-> " + ip)
+                hits = hits + 1
+            ]
+            i = i + 1
+        ]
+        log(c_dim("  " + str_repeat("-", 58)))
+        log("  " + hits.to_string() + " / " + n.to_string() + " variant(s) resolve — investigate any that are not yours")
+        end
+    ]
+    usage()
+    exit(1)
+]
