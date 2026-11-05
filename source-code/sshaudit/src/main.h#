@@ -1,0 +1,240 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; sshaudit — sshd hardening audit (reads `sshd -T` or /etc/ssh/sshd_config)
+;; Usage: sshaudit [--config=/etc/ssh/sshd_config]
+
+fn effective(cfg: string) -> string is
+    if have_cmd("sshd") is
+        let t: string = shell("sshd -T -f " + shquote(cfg) + " 2>/dev/null")
+        if string_len(trim(t)) > 0 is
+            return to_lower(t)
+        end
+    end
+    return to_lower(shell("grep -vE '^[[:space:]]*(#|$)' " + shquote(cfg) + " 2>/dev/null | sed 's/[[:space:]]\\+/ /'"))
+end
+
+fn val(conf: string, key: string) -> string is
+    let lines: [string] = split(conf, "\n")
+    let k: string = to_lower(key) + " "
+    let mut found: string = ""
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = trim(lines[i])
+        if starts_with(l, k) && found == "" is
+            found = trim(string_slice(l, string_len(k), string_len(l)))
+        end
+        i += 1
+    end
+    return found
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cfg: string = arg_val(args, "--config", "/etc/ssh/sshd_config")
+    banner("sshaudit", "0.2.0", cfg)
+    if !fs_exists(cfg) is
+        write(red_text("error:") + " cannot read " + cfg)
+        exit(1)
+    end
+    let c: string = effective(cfg)
+    let mut warns: int = 0
+    let mut fails: int = 0
+    let mut checks: int = 0
+    let mut t: [int] = [0, 0]
+    let mut sev: int = 0
+
+    let keys: [string] = ["permitrootlogin", "passwordauthentication", "permitemptypasswords", "pubkeyauthentication", "x11forwarding", "maxauthtries", "protocol", "allowtcpforwarding", "permituserenvironment", "logingracetime", "clientaliveinterval", "usepam"]
+    ;; expected-bad values → severity; "" means "report only"
+    let bad: [string] = ["yes", "yes", "yes", "no", "yes", "", "1", "", "yes", "", "", ""]
+    let sevs: [int] = [2, 1, 2, 1, 1, 0, 2, 0, 2, 0, 0, 0]
+    let mut i: int = 0
+    while i < array_len(keys) is
+        let v: string = val(c, keys[i])
+        if v != "" is
+            checks += 1
+            let k: string = keys[i]
+            let mut s: int = 0
+            if bad[i] != "" && v == bad[i] is
+                s = sevs[i]
+            end
+            if k == "maxauthtries" && to_int(v) > 4 is
+                s = 1
+            end
+            if k == "logingracetime" && to_int(v) > 60 is
+                s = 1
+            end
+            if k == "permitrootlogin" && v == "without-password" is
+                s = 0
+            end
+            if s == 0 is
+                sev = ok_line(k + " = " + v)
+            elsif s == 1 is
+                sev = warn_line(k + " = " + v + dim_text("  (harden this)"))
+            else is
+                sev = bad_line(k + " = " + v + dim_text("  (dangerous)"))
+            end
+            t = tally(sev, warns, fails)
+            warns = t[0]
+            fails = t[1]
+        end
+        i += 1
+    end
+
+    ;; weak algorithms
+    let weak: [string] = ["3des-cbc", "arcfour", "blowfish-cbc", "cast128-cbc", "hmac-md5", "hmac-sha1", "diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1", "ssh-dss"]
+    i = 0
+    let mut weak_found: string = ""
+    while i < array_len(weak) is
+        if contains(c, weak[i]) is
+            weak_found = weak_found + " " + weak[i]
+        end
+        i += 1
+    end
+    checks += 1
+    if weak_found == "" is
+        ok_line("no legacy ciphers / MACs / KEX configured")
+    else is
+        warns += 1
+        warn_line("weak algorithms enabled:" + weak_found)
+    end
+
+    checks += 1
+    if val(c, "allowusers") == "" && val(c, "allowgroups") == "" is
+        warns += 1
+        warn_line("no AllowUsers / AllowGroups restriction")
+    else is
+        ok_line("login restricted by AllowUsers/AllowGroups")
+    end
+    checks += 1
+    if val(c, "port") == "22" is
+        info_line("listening on default port 22 (fine with key-only auth + rate limiting)")
+    end
+    exit(summary("sshaudit", checks, warns, fails))
+end
