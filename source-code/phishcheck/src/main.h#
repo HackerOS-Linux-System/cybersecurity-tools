@@ -1,0 +1,262 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; phishcheck — URL & email heuristic phishing checker (defensive, no network side-effects beyond DNS)
+;; Usage: phishcheck url <url> | phishcheck headers <email.eml>
+
+fn homoglyph_hint(host: string) -> bool is
+    let i: int = string_len(host)
+    return re_match("xn--", to_lower(host))
+end
+
+fn has_many_subdomains(host: string) -> bool is
+    return array_len(split(host, ".")) >= 5
+end
+
+fn looks_like_ip(host: string) -> bool is
+    return re_match("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$", host)
+end
+
+fn brand_lookalike(host: string) -> string is
+    let brands: [string] = ["paypal", "google", "microsoft", "apple", "amazon", "facebook", "netflix", "bankofamerica", "wellsfargo", "chase", "coinbase", "binance"]
+    let h: string = to_lower(host)
+    let mut i: int = 0
+    while i < array_len(brands) is
+        let b: string = brands[i]
+        if contains(h, b) && h != b + ".com" && !ends_with(h, "." + b + ".com") is
+            return b
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn check_url(raw: string) is
+    banner("phishcheck url", "0.2.0", raw)
+    let mut url: string = raw
+    if !contains(url, "://") is
+        url = "http://" + url
+    end
+    let after: string = string_slice(url, string_len(split(url, "://")[0]) + 3, string_len(url))
+    let host: string = to_lower(split(split(after, "/")[0], "?")[0])
+    let hostonly: string = split(host, ":")[0]
+    let mut score: int = 0
+
+    if !starts_with(url, "https://") is
+        warn_line("not HTTPS")
+        score += 1
+    else is
+        ok_line("uses HTTPS")
+    end
+    if looks_like_ip(hostonly) is
+        bad_line("host is a bare IP address: " + hostonly)
+        score += 3
+    else is
+        ok_line("host is a domain name")
+    end
+    if contains(raw, "@") && !contains(split(raw, "://")[array_len(split(raw,"://"))-1], " ") && re_match("//[^/]+@", raw) is
+        bad_line("URL contains an '@' before the host — classic redirection trick")
+        score += 3
+    end
+    if homoglyph_hint(hostonly) is
+        warn_line("punycode / IDN host (xn--...) — verify it is not a lookalike domain")
+        score += 2
+    end
+    if has_many_subdomains(hostonly) is
+        warn_line("unusually many subdomain labels: " + hostonly)
+        score += 1
+    end
+    let brand: string = brand_lookalike(hostonly)
+    if brand != "" is
+        bad_line("mentions brand '" + brand + "' but host is '" + hostonly + "' — possible lookalike")
+        score += 3
+    end
+    if string_len(hostonly) > 30 is
+        warn_line("very long hostname (" + to_string(string_len(hostonly)) + " chars)")
+        score += 1
+    end
+    let susp_tld: [string] = [".zip", ".mov", ".top", ".gq", ".tk", ".xyz", ".click", ".country"]
+    let mut i: int = 0
+    while i < array_len(susp_tld) is
+        if ends_with(hostonly, susp_tld[i]) is
+            warn_line("TLD often abused for phishing: " + susp_tld[i])
+            score += 1
+        end
+        i += 1
+    end
+    write(dim_text("  " + string_repeat("─", 58)))
+    if score >= 5 is
+        write("  " + red_text("high risk (" + to_string(score) + ") — treat as phishing until verified"))
+        exit(2)
+    elsif score >= 2 is
+        write("  " + yellow_text("medium risk (" + to_string(score) + ") — inspect before trusting"))
+        exit(1)
+    end
+    write("  " + green_text("low risk (" + to_string(score) + ")") + dim_text(" — heuristics only, not a guarantee"))
+end
+
+fn check_headers(path: string) is
+    banner("phishcheck headers", "0.2.0", path)
+    if !fs_is_file(path) is
+        write(red_text("error:") + " no such file")
+        exit(1)
+    end
+    let h: string = fs_read(path)
+    let from_: string = sh("printf %s " + shquote(h) + " | grep -im1 '^From:'")
+    let reply: string = sh("printf %s " + shquote(h) + " | grep -im1 '^Reply-To:'")
+    let spf: string = sh("printf %s " + shquote(h) + " | grep -im1 '^Received-SPF:'")
+    let dkim: string = sh("printf %s " + shquote(h) + " | grep -im1 'dkim=')")
+    info_line("From: " + trim(from_))
+    if reply != "" && !contains(reply, trim(split(from_, "<")[array_len(split(from_,"<"))-1])) is
+        warn_line("Reply-To differs from From — common in BEC/phishing")
+    end
+    if contains(to_lower(spf), "fail") is
+        bad_line("SPF check failed: " + trim(spf))
+    elsif spf != "" is
+        ok_line(trim(spf))
+    else is
+        warn_line("no Received-SPF header found")
+    end
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "url" is
+        check_url(positional(args, 2))
+        return
+    end
+    if cmd == "headers" is
+        check_headers(positional(args, 2))
+        return
+    end
+    banner("phishcheck", "0.2.0", "URL & email phishing heuristics")
+    write("  phishcheck url <url>")
+    write("  phishcheck headers <email.eml>")
+end
