@@ -1,0 +1,17 @@
+[package]
+-> name        => jwtinspect
+-> version     => 0.2.0
+-> description => HackerOS cybersecurity-tools — jwtinspect (HackerScript)
+-> authors     => ["HackerOS Team"]
+-> license     => MIT
+-> lang        => HackerScript
+-> using       => 0.6
+
+[layout]
+-> cmd => cmd
+
+[build]
+-> link => static
+
+[default-build]
+-> profile => release
