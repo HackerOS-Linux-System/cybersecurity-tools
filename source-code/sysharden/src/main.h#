@@ -1,0 +1,268 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; sysharden — Linux hardening audit (kernel, filesystem, accounts, network)
+;; Usage: sysharden [--fix-hints]
+
+fn sysctl_is(key: string, want: string, why: string, level: int, hints: bool) -> int is
+    let v: string = sh("sysctl -n " + key + " 2>/dev/null")
+    if v == "" is
+        return 0
+    end
+    if v == want is
+        return ok_line(key + " = " + v)
+    end
+    let msg: string = key + " = " + v + " (want " + want + ") — " + why + (if hints then "   fix: sysctl -w " + key + "=" + want else "" end)
+    if level == 2 is
+        return bad_line(msg)
+    end
+    return warn_line(msg)
+end
+
+fn mode_ok(path: string, max_mode: string, level: int) -> int is
+    if !fs_exists(path) is
+        return 0
+    end
+    let m: string = sh("stat -c %a " + shquote(path))
+    if to_int(m) <= to_int(max_mode) && !(to_int(m) % 10 > to_int(max_mode) % 10) is
+        return ok_line(path + " mode " + m)
+    end
+    let msg: string = path + " mode " + m + " (expected <= " + max_mode + ")"
+    if level == 2 is
+        return bad_line(msg)
+    end
+    return warn_line(msg)
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let hints: bool = arg_has(args, "--fix-hints")
+    banner("sysharden", "0.2.0", "Linux hardening audit")
+    let mut warns: int = 0
+    let mut fails: int = 0
+    let mut checks: int = 0
+    let mut t: [int] = [0, 0]
+    let mut sev: int = 0
+
+    write(bold("  kernel"))
+    let ks: [string] = ["kernel.randomize_va_space", "kernel.kptr_restrict", "kernel.dmesg_restrict", "kernel.yama.ptrace_scope", "kernel.unprivileged_bpf_disabled", "fs.protected_symlinks", "fs.protected_hardlinks", "fs.suid_dumpable"]
+    let kw: [string] = ["2", "2", "1", "1", "1", "1", "1", "0"]
+    let kl: [int] = [2, 1, 1, 1, 1, 1, 1, 1]
+    let kwhy: [string] = ["full ASLR", "hide kernel pointers", "restrict dmesg", "restrict ptrace", "no unprivileged eBPF", "symlink protection", "hardlink protection", "no core dumps from setuid"]
+    let mut i: int = 0
+    while i < array_len(ks) is
+        sev = sysctl_is(ks[i], kw[i], kwhy[i], kl[i], hints)
+        if sev >= 0 is
+            checks += 1
+        end
+        t = tally(sev, warns, fails)
+        warns = t[0]
+        fails = t[1]
+        i += 1
+    end
+
+    write(bold("  network"))
+    let ns: [string] = ["net.ipv4.tcp_syncookies", "net.ipv4.conf.all.rp_filter", "net.ipv4.conf.all.accept_redirects", "net.ipv4.conf.all.send_redirects", "net.ipv4.conf.all.accept_source_route", "net.ipv4.icmp_echo_ignore_broadcasts", "net.ipv4.ip_forward"]
+    let nw: [string] = ["1", "1", "0", "0", "0", "1", "0"]
+    let nwhy: [string] = ["SYN flood protection", "reverse-path filtering", "ignore ICMP redirects", "do not send redirects", "no source routing", "ignore broadcast ping", "not acting as a router"]
+    i = 0
+    while i < array_len(ns) is
+        sev = sysctl_is(ns[i], nw[i], nwhy[i], 1, hints)
+        checks += 1
+        t = tally(sev, warns, fails)
+        warns = t[0]
+        fails = t[1]
+        i += 1
+    end
+
+    write(bold("  files & permissions"))
+    let fp: [string] = ["/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/group", "/etc/ssh/sshd_config", "/boot", "/etc/crontab"]
+    let fm: [string] = ["640", "640", "644", "644", "644", "755", "644"]
+    i = 0
+    while i < array_len(fp) is
+        sev = mode_ok(fp[i], fm[i], 2)
+        checks += 1
+        t = tally(sev, warns, fails)
+        warns = t[0]
+        fails = t[1]
+        i += 1
+    end
+    checks += 1
+    let ww: string = sh("find / -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null | head -5 | tr '\\n' ' '")
+    if ww == "" is
+        ok_line("no world-writable directories without sticky bit")
+    else is
+        warns += 1
+        warn_line("world-writable dirs without sticky bit: " + ww)
+    end
+    checks += 1
+    let suid: string = sh("find / -xdev -type f -perm -4000 2>/dev/null | wc -l")
+    if to_int(suid) > 40 is
+        warns += 1
+        warn_line(suid + " SUID binaries (review with: find / -xdev -perm -4000)")
+    else is
+        ok_line(suid + " SUID binaries")
+    end
+
+    write(bold("  accounts"))
+    checks += 1
+    let uid0: string = sh("awk -F: '$3 == 0 && $1 != \"root\" {print $1}' /etc/passwd | tr '\\n' ' '")
+    if uid0 == "" is
+        ok_line("only root has UID 0")
+    else is
+        fails += 1
+        bad_line("extra UID 0 accounts: " + uid0)
+    end
+    checks += 1
+    let empty: string = sh("awk -F: '($2 == \"\" ) {print $1}' /etc/shadow 2>/dev/null | tr '\\n' ' '")
+    if empty == "" is
+        ok_line("no accounts with empty passwords (or shadow unreadable)")
+    else is
+        fails += 1
+        bad_line("accounts with empty password: " + empty)
+    end
+
+    write(bold("  services"))
+    checks += 1
+    let listen: string = sh("ss -H -tlnp 2>/dev/null | grep -vE '127\\.0\\.0\\.1|\\[::1\\]' | wc -l")
+    if to_int(listen) > 8 is
+        warns += 1
+        warn_line(listen + " TCP listeners exposed on non-loopback interfaces")
+    else is
+        ok_line(listen + " externally reachable TCP listeners")
+    end
+    checks += 1
+    if sh("systemctl is-active ufw nftables firewalld 2>/dev/null | grep -c '^active'") == "0" && sh("iptables -S 2>/dev/null | wc -l") == "3" is
+        fails += 1
+        bad_line("no active firewall found (ufw / nftables / firewalld / iptables)")
+    else is
+        ok_line("a firewall service or ruleset is present")
+    end
+    exit(summary("sysharden", checks, warns, fails))
+end
