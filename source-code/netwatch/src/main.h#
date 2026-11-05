@@ -1,0 +1,224 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; netwatch — live connection & listening-socket watchdog (uses ss)
+;; Usage: netwatch listen | netwatch conns [--host=ip] | netwatch watch [--secs=5] [--rounds=6]
+
+fn have_ss() -> bool is
+    return have_cmd("ss")
+end
+
+fn show_listen() is
+    banner("netwatch listen", "0.2.0", "listening sockets")
+    if !have_ss() is
+        write(red_text("error:") + " ss not found")
+        exit(1)
+    end
+    write(sh("ss -H -tulnp 2>/dev/null | awk '{printf \"  %-6s %-24s %s\\n\",$1,$5,$7}'"))
+    let ext: string = sh("ss -H -tlnp 2>/dev/null | grep -vE '127\\.0\\.0\\.1|\\[::1\\]' | wc -l")
+    write("")
+    if to_int(ext) > 0 is
+        write("  " + yellow_text(ext + " listener(s) reachable from outside loopback"))
+    else is
+        write("  " + green_text("all listeners are loopback-only"))
+    end
+end
+
+fn show_conns(host: string) is
+    banner("netwatch conns", "0.2.0", if host == "" then "established connections" else host end)
+    if !have_ss() is
+        write(red_text("error:") + " ss not found")
+        exit(1)
+    end
+    let mut filt: string = ""
+    if host != "" is
+        filt = "dst " + host
+    end
+    write(sh("ss -H -tnp state established " + filt + " 2>/dev/null | awk '{printf \"  %-24s -> %-24s\\n\",$4,$5}'"))
+    show_table_top("remote hosts by connection count", "ss -H -tn state established 2>/dev/null | awk '{print $5}' | sed -E 's/:[0-9]+$//' | sort | uniq -c | sort -rn | head -10")
+end
+
+fn show_table_top(title: string, cmd: string) is
+    let out: string = sh(cmd)
+    if trim(out) == "" is
+        return
+    end
+    write("")
+    write(bold("  " + title))
+    write(sh("printf %s " + shquote(out) + " | sed 's/^/    /'"))
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || arg_has(args, "--help") is
+        banner("netwatch", "0.2.0", "connection & listener watchdog")
+        write("  netwatch listen                     all listening TCP/UDP sockets")
+        write("  netwatch conns [--host=ip]           established connections, optionally filtered")
+        write("  netwatch watch [--secs=5] [--rounds=6]   repeated snapshot, flags new listeners")
+        return
+    end
+    if cmd == "listen" is
+        show_listen()
+        return
+    end
+    if cmd == "conns" is
+        show_conns(arg_val(args, "--host", ""))
+        return
+    end
+    if cmd == "watch" is
+        let secs: int = to_int(arg_val(args, "--secs", "5"))
+        let rounds: int = to_int(arg_val(args, "--rounds", "6"))
+        banner("netwatch watch", "0.2.0", to_string(rounds) + " x " + to_string(secs) + "s")
+        let mut prev: string = ""
+        let mut r: int = 0
+        while r < rounds is
+            let now: string = sh("ss -H -tlnp 2>/dev/null | awk '{print $4}' | sort")
+            if prev != "" is
+                let lines: [string] = split(now, "\n")
+                let mut i: int = 0
+                while i < array_len(lines) is
+                    if lines[i] != "" && !contains(prev, lines[i]) is
+                        write("  " + yellow_text("NEW LISTENER ") + lines[i])
+                    end
+                    i += 1
+                end
+            end
+            prev = now
+            r += 1
+            if r < rounds is
+                sh("sleep " + to_string(secs))
+            end
+        end
+        write("  " + green_text("watch complete"))
+        return
+    end
+    write(red_text("error:") + " unknown command")
+    exit(1)
+end
