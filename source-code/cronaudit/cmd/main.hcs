@@ -1,0 +1,245 @@
+using <0.6>
+get <std:string> import <str_trim::str_split::str_contains::str_starts_with::str_replace::str_join::str_repeat::str_to_int::str_ends_with::str_to_float::str_index_of>
+get <std:io> import <read_file_or::write_file_ok::file_readable>
+get <std:fs> import <list_dir_or_empty::create_dir_ok>
+
+!! ── cybersec prelude (HackerScript) — shared helpers, 0.2 ───────────────────
+!! Authorised testing only: run these tools against systems you own or are
+!! explicitly permitted to assess.
+
+!! always succeeds at the run_command level (so a non-zero exit inside
+!! `cmd`, e.g. a `grep` with no match, never turns into a silent Err /
+!! empty string) — the real exit status is not needed by these tools,
+!! which only look at stdout text.
+fun sh(cmd: Str) -> Str [
+    match run_command("/bin/sh".to_string(), ["-c".to_string(), cmd + "; true"]) [
+        Ok(o) -> [ end str_trim(o) ]
+        Err(_e) -> [ end "" ]
+    ]
+]
+
+fun have_cmd(name: Str) -> Bool [
+    end command_ok(name)
+]
+
+fun command_ok(name: Str) -> Bool [
+    end sh("command -v " + sh_quote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+]
+
+fun sh_quote(s: Str) -> Str [
+    end "'" + str_replace(s, "'", "'\\''") + "'"
+]
+
+fun arg_has(args: List<Str>, flag: Str) -> Bool [
+    let i = 0
+    let n = args.len()
+    while i < n [
+        if args[i] == flag [
+            end true
+        ]
+        i = i + 1
+    ]
+    end false
+]
+
+fun arg_val(args: List<Str>, key: Str, dflt: Str) -> Str [
+    let pre: Str = key + "="
+    let i = 0
+    let n = args.len()
+    while i < n [
+        let a: Str = args[i].clone()
+        if str_starts_with(a.clone(), pre.clone()) [
+            end a.slice(pre.len(), a.len())
+        ]
+        if a == key and i + 1 < n [
+            end args[i + 1].clone()
+        ]
+        i = i + 1
+    ]
+    end dflt
+]
+
+fun positional(args: List<Str>, n: Int) -> Str [
+    let seen = 0
+    let i = 0
+    let total = args.len()
+    while i < total [
+        let a: Str = args[i].clone()
+        if not str_starts_with(a.clone(), "-") [
+            seen = seen + 1
+            if seen == n [
+                end a
+            ]
+        ]
+        i = i + 1
+    ]
+    end ""
+]
+
+fun c_cyan(s: Str) -> Str [ end "\e[36m" + s + "\e[0m" ]
+fun c_green(s: Str) -> Str [ end "\e[32m" + s + "\e[0m" ]
+fun c_yellow(s: Str) -> Str [ end "\e[33m" + s + "\e[0m" ]
+fun c_red(s: Str) -> Str [ end "\e[31m" + s + "\e[0m" ]
+fun c_dim(s: Str) -> Str [ end "\e[2m" + s + "\e[0m" ]
+fun c_bold(s: Str) -> Str [ end "\e[1m" + s + "\e[0m" ]
+
+fun banner(name: Str, ver: Str, desc: Str) [
+    log("")
+    log(c_cyan("  | " + name) + c_dim("  v" + ver + "  -  " + desc))
+    log(c_dim("  " + str_repeat("-", 58)))
+]
+
+fun ok_line(msg: Str) -> Int [
+    log("  " + c_green("PASS") + "  " + msg)
+    end 0
+]
+
+fun warn_line(msg: Str) -> Int [
+    log("  " + c_yellow("WARN") + "  " + msg)
+    end 1
+]
+
+fun bad_line(msg: Str) -> Int [
+    log("  " + c_red("FAIL") + "  " + msg)
+    end 2
+]
+
+fun info_line(msg: Str) [
+    log("  " + c_cyan("INFO") + "  " + msg)
+]
+
+fun pad_right(s: Str, width: Int) -> Str [
+    let out: Str = s.clone()
+    while out.len() < width [
+        out = out + " "
+    ]
+    end out
+]
+
+fun summary(tool: Str, checks: Int, warns: Int, fails: Int) -> Int [
+    log(c_dim("  " + str_repeat("-", 58)))
+    let line = tool + ": " + checks.to_string() + " checks, " + warns.to_string() + " warnings, " + fails.to_string() + " failures"
+    if fails > 0 [
+        log("  " + c_red(line))
+        end 2
+    ]
+    if warns > 0 [
+        log("  " + c_yellow(line))
+        end 1
+    ]
+    log("  " + c_green(line))
+    end 0
+]
+
+fun home_dir() -> Str [
+    match env_var("HOME") [
+        Some(v) -> [ end v ]
+        None -> [ end "/root" ]
+    ]
+]
+
+fun state_dir(tool: Str) -> Str [
+    let d = home_dir() + "/.hackeros/" + tool
+    sh("mkdir -p " + sh_quote(d))
+    end d
+]
+
+fun opt_int_or(o: Option<Int>, dflt: Int) -> Int [
+    match o [
+        Some(v) -> [ end v ]
+        None -> [ end dflt ]
+    ]
+]
+
+fun arg_int(args: List<Str>, key: Str, dflt: Int) -> Int [
+    end opt_int_or(str_to_int(arg_val(args, key, dflt.to_string())), dflt)
+]
+
+!! cronaudit — crontab & systemd-timer hygiene audit (world-writable scripts, odd schedules)
+!! Usage: cronaudit
+
+fun check_script_perms(cmdline: Str, label: Str) -> Int [
+    let script: Str = str_trim(str_split(cmdline, " ")[0].clone())
+    if not str_starts_with(script, "/") [
+        end 0
+    ]
+    if not file_readable(script) [
+        end warn_line(label + " references a script that cannot be read: " + script)
+    ]
+    let perm = sh("stat -c %a " + sh_quote(script) + " 2>/dev/null")
+    let w_group_or_other = sh("stat -c %a " + sh_quote(script) + " 2>/dev/null | tail -c 2")
+    if str_contains(perm, "7") or str_contains(w_group_or_other, "2") or str_contains(w_group_or_other, "3") or str_contains(w_group_or_other, "6") or str_contains(w_group_or_other, "7") [
+        end bad_line(label + " runs a group/other-writable script (mode " + perm + "): " + script)
+    ]
+    end ok_line(label + " script permissions look fine (" + perm + "): " + script)
+]
+
+fun main() [
+    let a = args()
+    if arg_has(a, "--help") [
+        banner("cronaudit", "0.2.0", "crontab & timer hygiene")
+        log("  cronaudit")
+        end
+    ]
+    banner("cronaudit", "0.2.0", "crontab & systemd timer hygiene")
+    let checks = 0
+    let warns = 0
+    let fails = 0
+
+    checks = checks + 1
+    let etc_cron = sh("cat /etc/crontab 2>/dev/null | grep -vE '^#|^$'")
+    let lines = str_split(etc_cron, "\n")
+    let i = 0
+    let n = lines.len()
+    let found = 0
+    while i < n [
+        let l: Str = str_trim(lines[i].clone())
+        if l != "" [
+            found = found + 1
+            let fields = str_split(l, " ")
+            if fields.len() >= 7 [
+                let cmd_part: Str = ""
+                let k = 6
+                let fn_ = fields.len()
+                while k < fn_ [
+                    if cmd_part != "" [
+                        cmd_part = cmd_part + " "
+                    ]
+                    cmd_part = cmd_part + fields[k].clone()
+                    k = k + 1
+                ]
+                let sev = check_script_perms(cmd_part, "/etc/crontab")
+                if sev == 1 [ warns = warns + 1 ]
+                if sev == 2 [ fails = fails + 1 ]
+            ]
+        ]
+        i = i + 1
+    ]
+    if found == 0 [
+        ok_line("/etc/crontab has no active entries")
+    ]
+
+    checks = checks + 1
+    let dirs = ["/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly"]
+    let j = 0
+    let dn = dirs.len()
+    while j < dn [
+        let d: Str = dirs[j].clone()
+        let world = sh("find " + sh_quote(d) + " -maxdepth 1 -perm -0002 -type f 2>/dev/null")
+        if str_trim(world) != "" [
+            fails = fails + 1
+            bad_line("world-writable file(s) in " + d + ":")
+            log(sh("printf %s " + sh_quote(world) + " | sed 's/^/    /'"))
+        ]
+        j = j + 1
+    ]
+    ok_line("checked " + dn.to_string() + " cron.* directories for world-writable entries")
+
+    checks = checks + 1
+    if have_cmd("systemctl") [
+        let timers = sh("systemctl list-timers --all --no-legend 2>/dev/null | wc -l")
+        info_line(timers + " systemd timer(s) configured")
+    ]
+
+    exit(summary("cronaudit", checks, warns, fails))
+]
