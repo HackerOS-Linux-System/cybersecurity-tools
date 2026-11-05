@@ -1,0 +1,204 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; wificheck — Wi-Fi / access-point configuration sanity checker (uses iw / nmcli)
+;; Usage: wificheck [--iface=wlan0]
+
+fn main() is
+    let args: [string] = env_args()
+    let iface: string = arg_val(args, "--iface", trim(sh("iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}'")))
+    banner("wificheck", "0.2.0", if iface == "" then "no wireless interface found" else iface end)
+    if iface == "" is
+        write(red_text("error:") + " no wireless interface detected (install iw?)")
+        exit(1)
+    end
+    let mut warns: int = 0
+    let mut fails: int = 0
+    let mut checks: int = 0
+    let mut t: [int] = [0, 0]
+    let mut sev: int = 0
+
+    let link: string = sh("iw dev " + shquote(iface) + " link 2>/dev/null")
+    if !contains(link, "Connected") is
+        write(yellow_text("  not currently associated to an AP — showing interface state only"))
+    else is
+        info_line(trim(split(link, "\n")[0]))
+    end
+
+    checks += 1
+    let sec: string = sh("nmcli -t -f active,ssid,security dev wifi 2>/dev/null | grep '^yes' | cut -d: -f3")
+    if sec == "" is
+        warns += 1
+        warn_line("could not read security type (nmcli unavailable or not connected)")
+    elsif contains(sec, "WPA3") is
+        sev = ok_line("security: " + sec)
+    elsif contains(sec, "WPA2") is
+        sev = warn_line("security: " + sec + " — consider WPA3 if your AP supports it")
+    elsif sec == "" || sec == "--" is
+        sev = bad_line("open network — no encryption")
+    else is
+        sev = bad_line("weak security: " + sec)
+    end
+    t = tally(sev, warns, fails)
+    warns = t[0]
+    fails = t[1]
+
+    checks += 1
+    let pwr: string = sh("iw dev " + shquote(iface) + " get power_save 2>/dev/null")
+    info_line(trim(pwr))
+
+    checks += 1
+    let mon: string = sh("iw dev " + shquote(iface) + " info 2>/dev/null | awk '/type/ {print $2}'")
+    if mon == "monitor" is
+        warns += 1
+        warn_line("interface is in monitor mode — not usable for normal connectivity")
+    else is
+        ok_line("mode: " + mon)
+    end
+
+    checks += 1
+    let mac: string = sh("cat /sys/class/net/" + shquote(iface) + "/address 2>/dev/null")
+    let rand: string = sh("nmcli -t -f 802-11-wireless.cloned-mac-address connection show --active 2>/dev/null | head -1")
+    if rand == "" || rand == ":" is
+        warns += 1
+        warn_line("MAC randomization not confirmed (hw addr " + mac + ") — consider enabling it for privacy on open Wi-Fi")
+    else is
+        ok_line("MAC randomization configured")
+    end
+
+    checks += 1
+    let ap_count: string = sh("nmcli -t -f ssid dev wifi 2>/dev/null | sort -u | wc -l")
+    info_line(to_string(to_int(ap_count)) + " SSIDs visible nearby")
+    let dup: string = sh("nmcli -t -f ssid dev wifi 2>/dev/null | sort | uniq -d | head -5")
+    if trim(dup) != "" is
+        warns += 1
+        warn_line("duplicate SSIDs nearby (possible evil-twin): " + replace(trim(dup), "\n", ", "))
+    end
+    exit(summary("wificheck", checks, warns, fails))
+end
