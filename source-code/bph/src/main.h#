@@ -1,0 +1,582 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; bph — "Become Pentest Hero": containerised distro lab + own-tools suite
+;; Rewrite (0.2) of the old Odin backend + Crystal CLI + Go TUI + Python own-tools,
+;; 100% H#. Educational use — always get written permission before testing a target.
+
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+fn engine() -> string is
+    if have_cmd("podman") is return "podman" end
+    if have_cmd("docker") is return "docker" end
+    return ""
+end
+
+fn container_name(distro: string) -> string is
+    return "bph-" + distro
+end
+
+fn image_for(distro: string) -> string is
+    if distro == "kali" is return "docker.io/kalilinux/kali-rolling:latest" end
+    if distro == "blackarch" is return "docker.io/blackarch/blackarch:latest" end
+    return ""
+end
+
+fn log_dir() -> string is
+    return state_dir("bph") + "/logs"
+end
+
+fn plugin_dir() -> string is
+    return state_dir("bph") + "/plugins"
+end
+
+fn warn_tool(tool: string) -> bool is
+    return tool == "hydra" || tool == "sqlmap" || tool == "nikto"
+end
+
+fn tool_doc(name: string) -> [string] is
+    ;; name|description|example
+    let docs: [string] = [
+        "nmap|Network scanner for discovering hosts and services.|nmap -sV target_ip",
+        "metasploit|Framework for exploiting vulnerabilities.|msfconsole",
+        "wireshark|Packet analyzer for network traffic.|wireshark",
+        "aircrack-ng|Wi-Fi security assessment suite.|airodump-ng wlan0",
+        "burpsuite|Web vulnerability scanner.|burpsuite",
+        "john|Password cracker.|john hashes.txt",
+        "hydra|Online password brute-forcer.|hydra -l user -P passlist ssh://target",
+        "nikto|Web server scanner.|nikto -h target.com",
+        "sqlmap|SQL injection exploiter.|sqlmap -u target_url",
+        "maltego|OSINT visualization tool.|maltego",
+        "own-tools|Built-in pentesting toolkit.|bph own-tools port-scan 10.0.0.5"
+    ]
+    let mut i: int = 0
+    while i < array_len(docs) is
+        let f: [string] = split(docs[i], "|")
+        if f[0] == name is
+            return f
+        end
+        i += 1
+    end
+    return []
+end
+
+fn print_help() is
+    banner("bph", "0.2.0", "Become Pentest Hero — educational pentest lab")
+    write("  bph init <distro>                create a container (kali | blackarch)")
+    write("  bph enter <distro>                enter the container shell")
+    write("  bph run <distro> <tool> [args]    run a tool inside the container, logged")
+    write("  bph own-tools <subcmd> [args]     port-scan | vuln-check | pass-gen | hash-crack | osint-search")
+    write("  bph docs <tool>                   tool documentation")
+    write("  bph parse <tool> <file>           parse a logged tool run into JSON")
+    write("  bph checklist <tool>              pre-attack checklist")
+    write("  bph snapshot save|restore <distro> <file>")
+    write("  bph stealth                       local system identification (educational)")
+    write("  bph report <YYYY-MM-DD>           HTML report from that day's logs")
+    write("  bph network create <name>         isolated podman/docker network")
+    write("  bph gateway start tor             start a local Tor SOCKS gateway")
+    write("  bph clean <distro>                clear container logs")
+    write("  bph detect-sandbox                check whether you're inside a VM/sandbox")
+    write("  bph session new|attach <distro> <tool>   detachable tmux session")
+    write("  bph tui                           simple menu-driven front-end")
+    write("")
+    write(dim_text("  Learn ethically — only test systems you own or are authorised to assess."))
+end
+
+fn require_engine() -> string is
+    let e: string = engine()
+    if e == "" is
+        write(red_text("error:") + " no podman/docker found")
+        exit(1)
+    end
+    return e
+end
+
+fn require_distro(distro: string) -> string is
+    let img: string = image_for(distro)
+    if img == "" is
+        write(red_text("error:") + " unsupported distro '" + distro + "' (use kali or blackarch)")
+        exit(1)
+    end
+    return img
+end
+
+fn write_log(tool: string, output: string) is
+    fs_mkdir_all(log_dir())
+    let date: string = sh("date +%F")
+    let path: string = log_dir() + "/" + date + "_" + tool + ".log"
+    fs_write(path, output)
+end
+
+fn confirm_if_warn(tool: string) -> bool is
+    if !warn_tool(tool) is
+        return true
+    end
+    write(yellow_text("  Do you have written permission to test this target?") + " [y/N]")
+    let a: string = to_lower(trim(sh("read -r a; echo \"$a\"")))
+    if a != "y" && a != "yes" is
+        write(red_text("  aborting."))
+        return false
+    end
+    return true
+end
+
+;; ── own-tools (pure H#, replaces the old Python helper) ─────────────────────
+fn ot_port_scan(target: string) is
+    banner("own-tools port-scan", "0.2.0", target)
+    let mut open_p: string = ""
+    let mut p: int = 1
+    while p <= 1024 is
+        if scan_port(target, p, 300) is
+            open_p = open_p + " " + to_string(p)
+            write("  " + green_text(string_pad_right(to_string(p) + "/tcp", 10)) + "open")
+        end
+        p += 1
+    end
+    if open_p == "" is
+        write(dim_text("  no open ports in 1-1024"))
+    end
+end
+
+fn ot_vuln_check(url: string) is
+    let mut u: string = url
+    if !starts_with(u, "http://") && !starts_with(u, "https://") is
+        u = "http://" + u
+    end
+    banner("own-tools vuln-check", "0.2.0", u)
+    let hdr: string = sh("curl -sS -I --max-time 6 " + shquote(u) + " 2>&1")
+    if !contains(hdr, "HTTP/") is
+        write(red_text("  error checking URL"))
+        return
+    end
+    let srv: string = sh("printf %s " + shquote(hdr) + " | grep -i '^Server:' | cut -d: -f2- | tr -d '\\r'")
+    if trim(srv) != "" is
+        warn_line("Server header exposed:" + srv)
+    end
+    let body: string = sh("curl -sS --max-time 6 " + shquote(u) + " 2>/dev/null")
+    if contains(body, "DVWA") is
+        warn_line("possible DVWA instance detected")
+    end
+    if trim(srv) == "" && !contains(body, "DVWA") is
+        ok_line("no obvious issues from this quick check")
+    end
+end
+
+fn ot_pass_gen(length: int) is
+    let n: int = if length > 0 then length else 16 end
+    write(sh("tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c " + to_string(n)))
+    write("")
+end
+
+fn ot_hash_crack(hash_str: string) is
+    let words: [string] = ["password", "123456", "qwerty", "admin", "letmein", "welcome", "monkey", "dragon", "football", "iloveyou"]
+    let h: string = to_lower(hash_str)
+    let mut i: int = 0
+    while i < array_len(words) is
+        if md5(words[i]) == h || sha1(words[i]) == h || sha256(words[i]) == h is
+            write(green_text("cracked:") + " " + words[i])
+            return
+        end
+        i += 1
+    end
+    write(dim_text("not cracked (small built-in dictionary — use hashkit + a real wordlist)"))
+end
+
+fn ot_osint_search(query: string) is
+    banner("own-tools osint-search", "0.2.0", query)
+    if have_cmd("whois") is
+        write(bold("  whois"))
+        write(sh("whois " + shquote(query) + " 2>/dev/null | head -20"))
+    end
+    write(bold("  DNS"))
+    write(sh("getent ahosts " + shquote(query) + " 2>/dev/null | awk '{print $1}' | sort -u"))
+    write(dim_text("  (passive, local-tool lookups only — no third-party API calls)"))
+end
+
+fn own_tools(args: [string]) is
+    let sub: string = positional(args, 2)
+    if sub == "port-scan" is ot_port_scan(positional(args, 3)) return end
+    if sub == "vuln-check" is ot_vuln_check(positional(args, 3)) return end
+    if sub == "pass-gen" is ot_pass_gen(to_int(positional(args, 3))) return end
+    if sub == "hash-crack" is ot_hash_crack(positional(args, 3)) return end
+    if sub == "osint-search" is ot_osint_search(positional(args, 3)) return end
+    write("Usage: bph own-tools <subcommand> [args]")
+    write("Subcommands: port-scan <target> | vuln-check <url> | pass-gen <length> | hash-crack <hash> | osint-search <query>")
+end
+
+;; ── built-in output parsers (replace the old Lua-plugin layer) ──────────────
+fn parse_nmap(raw: string) -> string is
+    let open_lines: string = sh("printf %s " + shquote(raw) + " | grep -E '^[0-9]+/(tcp|udp)\\s+open' | tr -s ' '")
+    let mut ports: string = ""
+    let rows: [string] = split(trim(open_lines), "\n")
+    let mut i: int = 0
+    while i < array_len(rows) is
+        if rows[i] != "" is
+            let f: [string] = split(rows[i], " ")
+            if i > 0 is ports = ports + "," end
+            ports = ports + "\"" + f[0] + (if array_len(f) > 2 then " " + f[2] else "" end) + "\""
+        end
+        i += 1
+    end
+    return "{\"tool\":\"nmap\",\"open_ports\":[" + ports + "]}"
+end
+
+fn parse_generic(tool: string, raw: string) -> string is
+    let lines: int = array_len(split(raw, "\n"))
+    return "{\"tool\":\"" + tool + "\",\"lines\":" + to_string(lines) + "}"
+end
+
+fn do_parse(tool: string, raw: string) -> string is
+    if tool == "nmap" is
+        return parse_nmap(raw)
+    end
+    return parse_generic(tool, raw)
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || cmd == "help" || cmd == "--help" is
+        print_help()
+        return
+    end
+    fs_mkdir_all(log_dir())
+    fs_mkdir_all(plugin_dir())
+
+    if cmd == "own-tools" is
+        own_tools(args)
+        return
+    end
+    if cmd == "docs" is
+        let t: [string] = tool_doc(positional(args, 2))
+        if array_len(t) == 0 is
+            write(red_text("Tool not found.") + " Available: nmap, metasploit, wireshark, aircrack-ng, burpsuite, john, hydra, nikto, sqlmap, maltego, own-tools")
+            exit(1)
+        end
+        write(green_text(t[0] + ":") + " " + t[1])
+        write("Example: " + t[2])
+        return
+    end
+    if cmd == "checklist" is
+        let t: string = positional(args, 2)
+        if t == "aircrack-ng" is
+            system(sh("echo iwconfig"))
+            write(sh("iwconfig 2>&1"))
+            write(yellow_text("Checklist: Ensure Wi-Fi card is in Monitor mode. Run 'airmon-ng start wlan0' if not."))
+        else is
+            write(red_text("No checklist for this tool."))
+        end
+        return
+    end
+    if cmd == "stealth" is
+        write(green_text("Hostname: ") + sh("hostname"))
+        write(green_text("Kernel:   ") + sh("uname -a"))
+        return
+    end
+    if cmd == "detect-sandbox" is
+        let cpuinfo: string = sh("cat /proc/cpuinfo 2>/dev/null")
+        if contains(cpuinfo, "hypervisor") is
+            write(yellow_text("Detected virtualization (possible sandbox)."))
+        else is
+            write(green_text("No obvious sandbox detected."))
+        end
+        return
+    end
+    if cmd == "report" is
+        let date: string = positional(args, 2)
+        if date == "" is
+            write("Usage: bph report <date> (YYYY-MM-DD)")
+            exit(1)
+        end
+        let files: string = sh("ls -1 " + shquote(log_dir()) + " 2>/dev/null | grep " + shquote(date))
+        let mut body: string = "<html><body><h1>Pentest Report - " + date + "</h1>"
+        let rows: [string] = split(trim(files), "\n")
+        let mut i: int = 0
+        while i < array_len(rows) is
+            if rows[i] != "" is
+                let parts: [string] = split(rows[i], "_")
+                let tool: string = replace(string_slice(rows[i], string_len(parts[0]) + 1, string_len(rows[i])), ".log", "")
+                let content: string = fs_read(log_dir() + "/" + rows[i])
+                body = body + "<h2>" + tool + "</h2><pre>" + do_parse(tool, content) + "</pre>"
+            end
+            i += 1
+        end
+        body = body + "</body></html>"
+        fs_write("report.html", body)
+        write(green_text("Report generated: report.html"))
+        return
+    end
+    if cmd == "parse" is
+        let tool: string = positional(args, 2)
+        let file: string = positional(args, 3)
+        let raw: string = if fs_exists(file) then fs_read(file) else positional(args, 3) end
+        write(do_parse(tool, raw))
+        return
+    end
+
+    let eng: string = require_engine()
+
+    if cmd == "init" is
+        let distro: string = positional(args, 2)
+        let img: string = require_distro(distro)
+        exit(system("distrobox create --name " + container_name(distro) + " --image " + img))
+    end
+    if cmd == "enter" is
+        let distro: string = positional(args, 2)
+        require_distro(distro)
+        exit(system("distrobox enter " + container_name(distro)))
+    end
+    if cmd == "run" is
+        let distro: string = positional(args, 2)
+        let tool: string = positional(args, 3)
+        require_distro(distro)
+        if tool == "" is
+            write("Usage: bph run <distro> <tool> [args...]")
+            exit(1)
+        end
+        if tool == "own-tools" is
+            own_tools(array_concat(["bph", "own-tools"], tool_args_tail(args, 4)))
+            return
+        end
+        if !confirm_if_warn(tool) is
+            exit(1)
+        end
+        let rest: string = iter_join(tool_args_tail(args, 3), " ")
+        let output: string = shell("distrobox enter " + container_name(distro) + " -- " + rest + " 2>&1")
+        write_log(tool, output)
+        write(output)
+        return
+    end
+    if cmd == "snapshot" is
+        let mode: string = positional(args, 2)
+        let distro: string = positional(args, 3)
+        let file: string = positional(args, 4)
+        require_distro(distro)
+        if mode == "save" is
+            exit(system(eng + " container checkpoint --export " + shquote(file) + " " + container_name(distro)))
+        elsif mode == "restore" is
+            exit(system(eng + " container restore --import " + shquote(file) + " " + container_name(distro)))
+        end
+        write("Invalid mode: save or restore")
+        exit(1)
+    end
+    if cmd == "network" is
+        if positional(args, 2) == "create" is
+            exit(system(eng + " network create " + shquote(positional(args, 3))))
+        end
+        write("Usage: bph network create <name>")
+        exit(1)
+    end
+    if cmd == "gateway" is
+        if positional(args, 2) == "start" && positional(args, 3) == "tor" is
+            system(eng + " pull dperson/torproxy")
+            exit(system(eng + " run -d -p 9050:9050 --name bph-tor-gateway dperson/torproxy"))
+        end
+        write("Usage: bph gateway start tor")
+        exit(1)
+    end
+    if cmd == "clean" is
+        let distro: string = positional(args, 2)
+        require_distro(distro)
+        exit(system("distrobox enter " + container_name(distro) + " -- rm -rf /var/log/*"))
+    end
+    if cmd == "session" is
+        let mode: string = positional(args, 2)
+        let distro: string = positional(args, 3)
+        let tool: string = positional(args, 4)
+        let sname: string = "bph-" + tool
+        if mode == "new" is
+            exit(system("tmux new-session -d -s " + sname + " \"distrobox enter " + container_name(distro) + " -- " + tool + "\""))
+        elsif mode == "attach" is
+            exit(system("tmux attach-session -t " + sname))
+        end
+        write("Usage: bph session new/attach <distro> <tool>")
+        exit(1)
+    end
+    if cmd == "tui" is
+        run_tui()
+        return
+    end
+
+    write(red_text("Unknown command."))
+    print_help()
+    exit(1)
+end
+
+fn tool_args_tail(args: [string], start: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = start
+    while i < array_len(args) is
+        out = array_push(out, args[i])
+        i += 1
+    end
+    return out
+end
+
+;; Simple text menu — H# replacement for the old Go TUI (no external terminal lib needed)
+fn run_tui() is
+    let mut running: bool = true
+    while running is
+        write("")
+        write(cyan_text("  ┌─ bph tui ─────────────────────────┐"))
+        write("  1) init a distro        2) enter a distro")
+        write("  3) run a tool            4) own-tools")
+        write("  5) stealth info          6) detect-sandbox")
+        write("  7) docs                  0) quit")
+        write(cyan_text("  └────────────────────────────────────┘"))
+        let choice: string = trim(sh("read -rp '  > ' c; echo \"$c\""))
+        if choice == "1" is
+            let d: string = trim(sh("read -rp 'distro (kali/blackarch): ' d; echo \"$d\""))
+            system("bph init " + d)
+        elsif choice == "2" is
+            let d: string = trim(sh("read -rp 'distro: ' d; echo \"$d\""))
+            system("bph enter " + d)
+        elsif choice == "3" is
+            let d: string = trim(sh("read -rp 'distro: ' d; echo \"$d\""))
+            let t: string = trim(sh("read -rp 'tool + args: ' t; echo \"$t\""))
+            system("bph run " + d + " " + t)
+        elsif choice == "4" is
+            let t: string = trim(sh("read -rp 'own-tools subcommand + arg: ' t; echo \"$t\""))
+            system("bph own-tools " + t)
+        elsif choice == "5" is
+            system("bph stealth")
+        elsif choice == "6" is
+            system("bph detect-sandbox")
+        elsif choice == "7" is
+            let t: string = trim(sh("read -rp 'tool: ' t; echo \"$t\""))
+            system("bph docs " + t)
+        elsif choice == "0" is
+            running = false
+        else is
+            write(dim_text("  unknown choice"))
+        end
+    end
+end
