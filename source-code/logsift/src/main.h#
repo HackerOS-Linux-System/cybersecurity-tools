@@ -1,0 +1,221 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; logsift — log analyzer: SSH brute-force detection and web-probe detection
+;; Usage: logsift auth [--file=/var/log/auth.log] [--threshold=5] | logsift web <access.log>
+
+fn usage() is
+    banner("logsift", "0.2.0", "auth & web log analyzer")
+    write("  logsift auth [--file=path] [--threshold=5] [--top=10]   failed SSH logins per source IP")
+    write("  logsift web <access.log> [--top=10]                      scanners, probes, error spikes")
+end
+
+fn auth_source(file: string) -> string is
+    if file != "" is
+        return "cat " + shquote(file)
+    end
+    if fs_exists("/var/log/auth.log") is
+        return "cat /var/log/auth.log"
+    end
+    if fs_exists("/var/log/secure") is
+        return "cat /var/log/secure"
+    end
+    return "journalctl -u ssh -u sshd --no-pager 2>/dev/null"
+end
+
+fn show_table(title: string, cmd: string) is
+    write(bold("  " + title))
+    let out: string = sh(cmd)
+    if out == "" is
+        write(dim_text("    (none)"))
+        return
+    end
+    let rows: [string] = split(out, "\n")
+    let mut i: int = 0
+    while i < array_len(rows) is
+        write("    " + rows[i])
+        i += 1
+    end
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || arg_has(args, "--help") is
+        usage()
+        return
+    end
+    let top: string = arg_val(args, "--top", "10")
+
+    if cmd == "auth" is
+        let src: string = auth_source(arg_val(args, "--file", ""))
+        let th: int = to_int(arg_val(args, "--threshold", "5"))
+        banner("logsift auth", "0.2.0", src)
+        let ips: string = "grep -E 'Failed password|Invalid user|authentication failure' | grep -oE '([0-9]{{1,3}}\\.){{3}}[0-9]{{1,3}}' | sort | uniq -c | sort -rn"
+        let total: string = sh(src + " 2>/dev/null | grep -cE 'Failed password|Invalid user'")
+        info_line("failed attempts in log: " + total)
+        show_table("top sources", src + " 2>/dev/null | " + ips + " | head -" + top)
+        show_table("most targeted usernames", src + " 2>/dev/null | grep -E 'Invalid user|Failed password for' | sed -E 's/.*(Invalid user|Failed password for( invalid user)?) ([^ ]+) from.*/\\3/' | sort | uniq -c | sort -rn | head -" + top)
+        let hot: string = sh(src + " 2>/dev/null | " + ips + " | awk '$1 >= " + to_string(th) + " {print $2}'")
+        write("")
+        if hot == "" is
+            write("  " + green_text("no source reached the threshold of " + to_string(th)))
+            return
+        end
+        write("  " + red_text("brute-force suspects (>= " + to_string(th) + " failures):"))
+        let l: [string] = split(hot, "\n")
+        let mut i: int = 0
+        while i < array_len(l) is
+            write("    " + l[i] + dim_text("   e.g. block: nft add rule inet filter input ip saddr " + l[i] + " drop"))
+            i += 1
+        end
+        let acc: string = sh(src + " 2>/dev/null | grep -c 'Accepted'")
+        info_line("successful logins: " + acc)
+        exit(2)
+    end
+
+    if cmd == "web" is
+        let f: string = positional(args, 2)
+        if f == "" || !fs_is_file(f) is
+            write(red_text("error:") + " access log required")
+            exit(1)
+        end
+        banner("logsift web", "0.2.0", f)
+        info_line("requests: " + sh("wc -l < " + shquote(f)))
+        show_table("top client IPs", "awk '{print $1}' " + shquote(f) + " | sort | uniq -c | sort -rn | head -" + top)
+        show_table("status codes", "awk '{print $9}' " + shquote(f) + " | grep -E '^[0-9]{{3}}$' | sort | uniq -c | sort -rn | head -8")
+        let probes: string = "(\\.env|\\.git/|wp-login|wp-admin|xmlrpc|phpmyadmin|/admin|\\.\\./|etc/passwd|cmd=|/shell|\\.php\\?|/cgi-bin/|jndi:|<script|union.*select)"
+        show_table("probe-like requests per IP", "grep -aiE " + shquote(probes) + " " + shquote(f) + " | awk '{print $1}' | sort | uniq -c | sort -rn | head -" + top)
+        show_table("most probed paths", "grep -aiE " + shquote(probes) + " " + shquote(f) + " | awk '{print $7}' | sort | uniq -c | sort -rn | head -" + top)
+        show_table("IPs with many 404/403 (path scanners)", "awk '$9 ~ /^40[34]$/ {print $1}' " + shquote(f) + " | sort | uniq -c | sort -rn | awk '$1 >= 20' | head -" + top)
+        return
+    end
+    usage()
+    exit(1)
+end
