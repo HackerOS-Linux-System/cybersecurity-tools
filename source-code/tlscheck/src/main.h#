@@ -1,0 +1,239 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; tlscheck — TLS certificate & protocol audit (needs openssl)
+;; Usage: tlscheck <host>[:port] [--sni=name]
+
+fn usage() is
+    banner("tlscheck", "0.2.0", "TLS certificate and protocol audit")
+    write("  tlscheck <host>[:port] [--sni=name]")
+end
+
+fn s_client(hostport: string, sni: string, extra: string) -> string is
+    return shell("echo | timeout 8 openssl s_client -connect " + shquote(hostport) + " -servername " + shquote(sni) + " " + extra + " 2>&1")
+end
+
+fn proto_accepted(hostport: string, sni: string, flag: string) -> bool is
+    let out: string = s_client(hostport, sni, flag)
+    return contains(out, "BEGIN CERTIFICATE") && !contains(out, "alert protocol version") && !contains(out, "no protocols available") && !contains(out, "handshake failure")
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let target: string = positional(args, 1)
+    if target == "" || arg_has(args, "--help") is
+        usage()
+        return
+    end
+    if !have_cmd("openssl") is
+        write(red_text("error:") + " openssl not found")
+        exit(1)
+    end
+    let mut hostport: string = target
+    if !contains(target, ":") is
+        hostport = target + ":443"
+    end
+    let host: string = split(hostport, ":")[0]
+    let sni: string = arg_val(args, "--sni", host)
+    banner("tlscheck", "0.2.0", hostport)
+    let mut warns: int = 0
+    let mut fails: int = 0
+    let mut checks: int = 0
+
+    let out: string = s_client(hostport, sni, "")
+    if !contains(out, "BEGIN CERTIFICATE") is
+        bad_line("no TLS handshake with " + hostport)
+        exit(2)
+    end
+    let cert: string = sh("echo | timeout 8 openssl s_client -connect " + shquote(hostport) + " -servername " + shquote(sni) + " 2>/dev/null | openssl x509 -noout -subject -issuer -enddate -dates -ext subjectAltName 2>/dev/null")
+    info_line("subject: " + sh("printf %s " + shquote(cert) + " | grep -m1 '^subject' | sed 's/^subject= *//'"))
+    info_line("issuer:  " + sh("printf %s " + shquote(cert) + " | grep -m1 '^issuer' | sed 's/^issuer= *//'"))
+
+    ;; expiry
+    checks += 1
+    let end_date: string = sh("printf %s " + shquote(cert) + " | grep -m1 notAfter | cut -d= -f2")
+    let days: string = sh("echo $(( ( $(date -d " + shquote(end_date) + " +%s) - $(date +%s) ) / 86400 ))")
+    let d: int = to_int(days)
+    if d < 0 is
+        fails += 1
+        bad_line("certificate EXPIRED " + to_string(0 - d) + " days ago")
+    elsif d < 14 is
+        fails += 1
+        bad_line("certificate expires in " + days + " days")
+    elsif d < 30 is
+        warns += 1
+        warn_line("certificate expires in " + days + " days")
+    else is
+        ok_line("certificate valid for " + days + " more days")
+    end
+
+    ;; hostname match
+    checks += 1
+    let verify: string = sh("echo | timeout 8 openssl s_client -connect " + shquote(hostport) + " -servername " + shquote(sni) + " -verify_hostname " + shquote(host) + " 2>&1 | grep -m1 'Verification' ")
+    if contains(verify, "OK") is
+        ok_line("chain and hostname verify OK")
+    else is
+        fails += 1
+        bad_line("verification failed: " + verify)
+    end
+
+    ;; key size / signature
+    checks += 1
+    let text: string = sh("echo | timeout 8 openssl s_client -connect " + shquote(hostport) + " -servername " + shquote(sni) + " 2>/dev/null | openssl x509 -noout -text 2>/dev/null | grep -E 'Signature Algorithm|Public-Key' | head -2 | tr -s ' ' | tr '\\n' ';'")
+    if contains(text, "sha1With") || contains(text, "md5With") is
+        fails += 1
+        bad_line("weak signature algorithm: " + text)
+    else is
+        ok_line("signature / key: " + text)
+    end
+
+    ;; protocol versions
+    checks += 1
+    if proto_accepted(hostport, sni, "-tls1") is
+        fails += 1
+        bad_line("TLS 1.0 accepted (deprecated)")
+    else is
+        ok_line("TLS 1.0 rejected")
+    end
+    checks += 1
+    if proto_accepted(hostport, sni, "-tls1_1") is
+        fails += 1
+        bad_line("TLS 1.1 accepted (deprecated)")
+    else is
+        ok_line("TLS 1.1 rejected")
+    end
+    checks += 1
+    if proto_accepted(hostport, sni, "-tls1_3") is
+        ok_line("TLS 1.3 supported")
+    else is
+        warns += 1
+        warn_line("TLS 1.3 not supported")
+    end
+    exit(summary("tlscheck", checks, warns, fails))
+end
