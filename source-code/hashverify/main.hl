@@ -1,0 +1,66 @@
+#!/usr/bin/hl
+/// hashverify.hl — lekki weryfikator sumy kontrolnej katalogu (manifest SHA-256)
+/// Uzycie: ustaw @target_dir i @mode (init|check) ponizej, potem: hl run hashverify.hl
+/// Wymaga: sha256sum, find
+using <gen 2>
+
+// sha256sum
+
+% target_dir   = /tmp/hl_hashverify_demo
+% manifest     = /tmp/hl_hashverify.manifest
+% mode         = init
+
+::hr 58
+::bold  hashverify — lightweight directory checksum manifest
+::hr 58
+::nl
+
+~> Katalog:   @target_dir
+~> Manifest:  @manifest
+~> Tryb:      @mode
+
+::isdir @target_dir
+? err
+    ::yellow Katalog nie istnieje — tworze przykladowy do demonstracji.
+    > mkdir -p @target_dir
+    > bash -c "echo 'plik testowy A' > @target_dir/a.txt"
+    > bash -c "echo 'plik testowy B' > @target_dir/b.txt"
+done
+
+: build_manifest def
+    >> bash -c "find @target_dir -type f -print0 | sort -z | xargs -0 sha256sum" |> @_manifest_data
+    > bash -c "printf '%s\n' \"@_manifest_data\" > @manifest"
+    ~> Manifest zapisany: @manifest
+done
+
+: verify_manifest def
+    ::exists @manifest
+    ? err
+        ::red Brak manifestu — najpierw uruchom z @mode = init
+        > exit 1
+    done
+
+    >> bash -c "cd / && sha256sum -c @manifest --quiet 2>&1" |> @_verify_out
+    ~> @_verify_out
+
+    >> bash -c "find @target_dir -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/hl_hashverify.now 2>/dev/null; diff @manifest /tmp/hl_hashverify.now | grep -c '^[<>]'" |> @_diff_count
+    > rm -f /tmp/hl_hashverify.now
+
+    ?~ @_diff_count == 0
+        ::green Wszystkie pliki zgodne z manifestem.
+    done
+done
+
+? switch @mode
+| init
+    -- build_manifest
+| check
+    -- verify_manifest
+| *
+    ::red Nieznany tryb: @mode (oczekiwano init lub check)
+done
+
+::nl
+::hr 58
+::green hashverify zakonczony.
+::hr 58
