@@ -1,0 +1,88 @@
+#!/usr/bin/hl
+/// zipbomb-check.hl — wykrywa podejrzany stosunek rozmiaru po/przed rozpakowaniem
+/// (klasyczny "zip bomb" ma skrajnie wysoki wspolczynnik kompresji)
+/// Uzycie: ustaw @target_archive ponizej, potem: hl run zipbomb-check.hl
+/// Wymaga: unzip (dla .zip) lub gzip/tar (dla .tar.gz)
+using <gen 2>
+
+// unzip
+
+% target_archive = /tmp/sample.zip
+% max_ratio      = 100
+% max_total_mb   = 4096
+
+::hr 58
+::bold  zipbomb-check — archive expansion-ratio detector
+::hr 58
+::nl
+
+~> Archiwum:         @target_archive
+~> Prog ryzyka:      stosunek > @max_ratio x  lub  rozmiar > @max_total_mb MB
+
+::exists @target_archive
+? err
+    ::red Plik nie istnieje: @target_archive
+    > exit 1
+done
+
+> stat -c %s @target_archive |> @_compressed_size
+~> Rozmiar skompresowany: @_compressed_size B
+
+: analyze_zip def
+    >> bash -c "unzip -l @target_archive 2>/dev/null | tail -1 | awk '{print \$1}'" |> @_uncompressed_size
+    >> bash -c "unzip -l @target_archive 2>/dev/null | tail -n +4 | head -n -2 | wc -l" |> @_entry_count
+done
+
+: analyze_targz def
+    >> bash -c "tar -tzvf @target_archive 2>/dev/null | awk '{s+=\$3} END {print s+0}'" |> @_uncompressed_size
+    >> bash -c "tar -tzvf @target_archive 2>/dev/null | wc -l" |> @_entry_count
+done
+
+::which unzip
+? ok
+    -- analyze_zip
+done
+? err
+    -- analyze_targz
+done
+
+~> Rozmiar po rozpakowaniu: @_uncompressed_size B
+~> Liczba wpisow w archiwum: @_entry_count
+
+$( @_uncompressed_size / 1048576 ) -> @_uncompressed_mb
+
+?~ @_compressed_size == 0
+    ::red Nie mozna odczytac rozmiaru skompresowanego — przerywam.
+    > exit 1
+done
+
+;; przyblizony stosunek — dzielenie calkowitoliczbowe wystarcza do progu alarmowego
+$( @_uncompressed_size / @_compressed_size ) -> @_ratio
+
+~> Stosunek rozpakowany/skompresowany: ~@_ratio x
+~> Rozmiar po rozpakowaniu: ~@_uncompressed_mb MB
+
+% _risk = niskie
+
+?~ @_ratio > @max_ratio
+    % _risk = WYSOKIE
+done
+
+?~ @_uncompressed_mb > @max_total_mb
+    % _risk = WYSOKIE
+done
+
+? switch @_risk
+| WYSOKIE
+    ::nl
+    ::red UWAGA: archiwum wyglada jak potencjalny zip bomb.
+    ::red Nie rozpakowuj go bez ograniczen (ulimit, kontener, limit miejsca na dysku).
+| *
+    ::nl
+    ::green Stosunek kompresji w normie — brak oznak zip bomba.
+done
+
+::nl
+::hr 58
+::bold  zipbomb-check zakonczony — ryzyko: @_risk
+::hr 58
