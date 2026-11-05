@@ -1,9 +1,12 @@
 [workspace]
 -> name    => cybersecurity-tools
--> version => 0.1
+-> version => 0.2
 -> mode    => standard
--> members => ["source-code/hct", "source-code/eiv"]
+-> members => ["source-code/eic", "source-code/eiq", "source-code/eiv", "source-code/bph", "source-code/hashkit", "source-code/rip", "source-code/hct", "source-code/portwatch", "source-code/tlscheck", "source-code/hdrcheck", "source-code/fim", "source-code/logsift", "source-code/sshaudit", "source-code/secretscan", "source-code/sysharden", "source-code/jam", "source-code/netwatch", "source-code/wificheck", "source-code/phishcheck", "source-code/cybersecurity-cli", "source-code/passforge", "source-code/walldesign", "source-code/cryptolab", "source-code/netmap", "source-code/dnsshield", "source-code/backupaudit", "source-code/licwatch", "source-code/ratrace", "source-code/robotsaudit", "source-code/cveradar", "source-code/dockerlint", "source-code/cronaudit", "source-code/jwtinspect", "source-code/typosquat"]
 
 [build]
 -> parallel => true
 -> cache    => build/cache/
+
+[note]
+-> hacker-lang => source-code/pcapstat, source-code/zipbomb-check, source-code/hashverify  (single-file scripts, run directly with: hl run <tool>/main.hl — no Bit.hk build step)
