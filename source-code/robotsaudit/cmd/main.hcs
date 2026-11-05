@@ -1,0 +1,233 @@
+using <0.6>
+get <std:string> import <str_trim::str_split::str_contains::str_starts_with::str_replace::str_join::str_repeat::str_to_int::str_ends_with::str_to_float::str_index_of>
+get <std:io> import <read_file_or::write_file_ok::file_readable>
+get <std:fs> import <list_dir_or_empty::create_dir_ok>
+
+!! ── cybersec prelude (HackerScript) — shared helpers, 0.2 ───────────────────
+!! Authorised testing only: run these tools against systems you own or are
+!! explicitly permitted to assess.
+
+!! always succeeds at the run_command level (so a non-zero exit inside
+!! `cmd`, e.g. a `grep` with no match, never turns into a silent Err /
+!! empty string) — the real exit status is not needed by these tools,
+!! which only look at stdout text.
+fun sh(cmd: Str) -> Str [
+    match run_command("/bin/sh".to_string(), ["-c".to_string(), cmd + "; true"]) [
+        Ok(o) -> [ end str_trim(o) ]
+        Err(_e) -> [ end "" ]
+    ]
+]
+
+fun have_cmd(name: Str) -> Bool [
+    end command_ok(name)
+]
+
+fun command_ok(name: Str) -> Bool [
+    end sh("command -v " + sh_quote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+]
+
+fun sh_quote(s: Str) -> Str [
+    end "'" + str_replace(s, "'", "'\\''") + "'"
+]
+
+fun arg_has(args: List<Str>, flag: Str) -> Bool [
+    let i = 0
+    let n = args.len()
+    while i < n [
+        if args[i] == flag [
+            end true
+        ]
+        i = i + 1
+    ]
+    end false
+]
+
+fun arg_val(args: List<Str>, key: Str, dflt: Str) -> Str [
+    let pre: Str = key + "="
+    let i = 0
+    let n = args.len()
+    while i < n [
+        let a: Str = args[i].clone()
+        if str_starts_with(a.clone(), pre.clone()) [
+            end a.slice(pre.len(), a.len())
+        ]
+        if a == key and i + 1 < n [
+            end args[i + 1].clone()
+        ]
+        i = i + 1
+    ]
+    end dflt
+]
+
+fun positional(args: List<Str>, n: Int) -> Str [
+    let seen = 0
+    let i = 0
+    let total = args.len()
+    while i < total [
+        let a: Str = args[i].clone()
+        if not str_starts_with(a.clone(), "-") [
+            seen = seen + 1
+            if seen == n [
+                end a
+            ]
+        ]
+        i = i + 1
+    ]
+    end ""
+]
+
+fun c_cyan(s: Str) -> Str [ end "\e[36m" + s + "\e[0m" ]
+fun c_green(s: Str) -> Str [ end "\e[32m" + s + "\e[0m" ]
+fun c_yellow(s: Str) -> Str [ end "\e[33m" + s + "\e[0m" ]
+fun c_red(s: Str) -> Str [ end "\e[31m" + s + "\e[0m" ]
+fun c_dim(s: Str) -> Str [ end "\e[2m" + s + "\e[0m" ]
+fun c_bold(s: Str) -> Str [ end "\e[1m" + s + "\e[0m" ]
+
+fun banner(name: Str, ver: Str, desc: Str) [
+    log("")
+    log(c_cyan("  | " + name) + c_dim("  v" + ver + "  -  " + desc))
+    log(c_dim("  " + str_repeat("-", 58)))
+]
+
+fun ok_line(msg: Str) -> Int [
+    log("  " + c_green("PASS") + "  " + msg)
+    end 0
+]
+
+fun warn_line(msg: Str) -> Int [
+    log("  " + c_yellow("WARN") + "  " + msg)
+    end 1
+]
+
+fun bad_line(msg: Str) -> Int [
+    log("  " + c_red("FAIL") + "  " + msg)
+    end 2
+]
+
+fun info_line(msg: Str) [
+    log("  " + c_cyan("INFO") + "  " + msg)
+]
+
+fun pad_right(s: Str, width: Int) -> Str [
+    let out: Str = s.clone()
+    while out.len() < width [
+        out = out + " "
+    ]
+    end out
+]
+
+fun summary(tool: Str, checks: Int, warns: Int, fails: Int) -> Int [
+    log(c_dim("  " + str_repeat("-", 58)))
+    let line = tool + ": " + checks.to_string() + " checks, " + warns.to_string() + " warnings, " + fails.to_string() + " failures"
+    if fails > 0 [
+        log("  " + c_red(line))
+        end 2
+    ]
+    if warns > 0 [
+        log("  " + c_yellow(line))
+        end 1
+    ]
+    log("  " + c_green(line))
+    end 0
+]
+
+fun home_dir() -> Str [
+    match env_var("HOME") [
+        Some(v) -> [ end v ]
+        None -> [ end "/root" ]
+    ]
+]
+
+fun state_dir(tool: Str) -> Str [
+    let d = home_dir() + "/.hackeros/" + tool
+    sh("mkdir -p " + sh_quote(d))
+    end d
+]
+
+fun opt_int_or(o: Option<Int>, dflt: Int) -> Int [
+    match o [
+        Some(v) -> [ end v ]
+        None -> [ end dflt ]
+    ]
+]
+
+fun arg_int(args: List<Str>, key: Str, dflt: Int) -> Int [
+    end opt_int_or(str_to_int(arg_val(args, key, dflt.to_string())), dflt)
+]
+
+!! robotsaudit — robots.txt / security.txt / common sensitive-path exposure checker
+!! Usage: robotsaudit <url>
+
+fun fetch(url: Str) -> Str [
+    end sh("curl -sS --max-time 8 -o - -w '\\nHTTPSTATUS:%{http_code}' " + sh_quote(url) + " 2>/dev/null")
+]
+
+fun status_of(resp: Str) -> Str [
+    let idx = str_index_of(resp, "HTTPSTATUS:")
+    match idx [
+        Some(i) -> [ end resp.slice(i + 11, resp.len()) ]
+        None -> [ end "000" ]
+    ]
+]
+
+fun check_path(base: Str, path: Str, expect_ok: Bool, label: Str) -> Int [
+    let resp = fetch(base + path)
+    let st = status_of(resp)
+    if expect_ok [
+        if st == "200" [
+            end ok_line(label + " present (" + path + ")")
+        ]
+        end warn_line(label + " missing (" + path + " -> " + st + ")")
+    ]
+    if st == "200" [
+        end bad_line(label + " is PUBLICLY reachable: " + path)
+    ]
+    end ok_line(label + " not exposed (" + path + " -> " + st + ")")
+]
+
+fun usage() [
+    banner("robotsaudit", "0.2.0", "robots.txt / security.txt / exposure checker")
+    log("  robotsaudit <url>")
+]
+
+fun main() [
+    let a = args()
+    let raw = positional(a, 1)
+    if raw == "" or arg_has(a, "--help") [
+        usage()
+        end
+    ]
+    if not have_cmd("curl") [
+        log(c_red("error:") + " curl not found")
+        exit(1)
+    ]
+    let base: Str = raw
+    if not str_starts_with(base, "http://") and not str_starts_with(base, "https://") [
+        base = "https://" + base
+    ]
+    banner("robotsaudit", "0.2.0", base)
+    let checks = 0
+    let warns = 0
+    let fails = 0
+
+    checks = checks + 1
+    let sev1 = check_path(base, "/robots.txt", true, "robots.txt")
+    if sev1 == 1 [ warns = warns + 1 ]
+    if sev1 == 2 [ fails = fails + 1 ]
+
+    checks = checks + 1
+    let sev2 = check_path(base, "/.well-known/security.txt", true, "security.txt")
+    if sev2 == 1 [ warns = warns + 1 ]
+
+    let sensitive = ["/.env", "/.git/HEAD", "/.git/config", "/wp-config.php.bak", "/backup.zip", "/.aws/credentials", "/phpinfo.php", "/server-status", "/.htpasswd", "/id_rsa"]
+    let i = 0
+    let n = sensitive.len()
+    while i < n [
+        checks = checks + 1
+        let sev = check_path(base, sensitive[i].clone(), false, "sensitive path " + sensitive[i].clone())
+        if sev == 2 [ fails = fails + 1 ]
+        if sev == 1 [ warns = warns + 1 ]
+        i = i + 1
+    ]
+    exit(summary("robotsaudit", checks, warns, fails))
+]
