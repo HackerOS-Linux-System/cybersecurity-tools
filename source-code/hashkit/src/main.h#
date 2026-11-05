@@ -1,0 +1,326 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; hashkit — Hash & Crypto Toolkit for HackerOS
+;; Usage: hashkit <hash|hash-file|hmac|verify|id|entropy|hex|b64|rand|uuid> ...
+
+fn usage() is
+    banner("hashkit", "0.2.0", "hash & crypto toolkit")
+    write("  hashkit hash <md5|sha1|sha256|sha512> <text>")
+    write("  hashkit hash-file <md5|sha1|sha256|sha512> <path>")
+    write("  hashkit hmac <sha256|sha512> <key> <message>")
+    write("  hashkit verify <path> <expected-hash>      (algorithm guessed from length)")
+    write("  hashkit id <hash>                           identify a hash by length/charset")
+    write("  hashkit entropy <text> | --file <path>      Shannon entropy in bits/byte")
+    write("  hashkit hex <enc|dec> <text>")
+    write("  hashkit b64 <enc|dec> <text>")
+    write("  hashkit rand [bytes]                        random hex from the OS CSPRNG")
+    write("  hashkit uuid")
+end
+
+fn hash_text(algo: string, text: string) -> string is
+    if algo == "md5" is return md5(text) end
+    if algo == "sha1" is return sha1(text) end
+    if algo == "sha256" is return sha256(text) end
+    if algo == "sha512" is return sha512(text) end
+    return ""
+end
+
+fn hash_file(algo: string, path: string) -> string is
+    let tool: string = algo + "sum"
+    return sh(tool + " " + shquote(path) + " 2>/dev/null | cut -d' ' -f1")
+end
+
+fn guess_algo(h: string) -> string is
+    let n: int = string_len(h)
+    if n == 32 is return "md5" end
+    if n == 40 is return "sha1" end
+    if n == 64 is return "sha256" end
+    if n == 128 is return "sha512" end
+    return ""
+end
+
+fn identify(h: string) -> string is
+    let n: int = string_len(h)
+    if starts_with(h, "$2a$") || starts_with(h, "$2b$") || starts_with(h, "$2y$") is return "bcrypt" end
+    if starts_with(h, "$argon2") is return "argon2" end
+    if starts_with(h, "$6$") is return "sha512crypt (Unix)" end
+    if starts_with(h, "$5$") is return "sha256crypt (Unix)" end
+    if starts_with(h, "$1$") is return "md5crypt (Unix)" end
+    if !re_match("^[0-9a-fA-F]+$", h) is return "unknown (not plain hex)" end
+    if n == 32 is return "MD5 / NTLM / MD4 (weak — do not use for passwords)" end
+    if n == 40 is return "SHA-1 / RIPEMD-160 (deprecated)" end
+    if n == 56 is return "SHA-224 / SHA3-224" end
+    if n == 64 is return "SHA-256 / SHA3-256 / BLAKE2s" end
+    if n == 96 is return "SHA-384 / SHA3-384" end
+    if n == 128 is return "SHA-512 / SHA3-512 / BLAKE2b" end
+    return "unknown (" + to_string(n) + " hex chars)"
+end
+
+fn entropy_cmd(src: string) -> string is
+    let awk: string = "awk '{c[$1]++; n++} END {for (k in c) {p=c[k]/n; e-=p*log(p)/log(2)}; printf \"%.4f\", e}'"
+    return sh(src + " | od -An -v -tu1 | tr -s ' ' '\\n' | grep -v '^$' | " + awk)
+end
+
+fn verdict(e: string) -> string is
+    let parts: [string] = split(e, ".")
+    let whole: string = parts[0]
+    let mut v: int = to_int(whole)
+    if v >= 7 && e >= "7.5" is v = 8 end
+    if v >= 8 is return "very high — encrypted / compressed / random" end
+    if v >= 6 is return "high — packed or binary data" end
+    if v >= 4 is return "medium — typical text / code" end
+    return "low — highly repetitive"
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || arg_has(args, "--help") || arg_has(args, "-h") is
+        usage()
+        return
+    end
+
+    if cmd == "hash" is
+        let algo: string = positional(args, 2)
+        let text: string = positional(args, 3)
+        let h: string = hash_text(algo, text)
+        if h == "" is
+            write(red_text("error:") + " unsupported algorithm '" + algo + "'")
+            exit(1)
+        end
+        write(h)
+        return
+    end
+
+    if cmd == "hash-file" is
+        let algo: string = positional(args, 2)
+        let path: string = positional(args, 3)
+        if !fs_is_file(path) is
+            write(red_text("error:") + " no such file: " + path)
+            exit(1)
+        end
+        let h: string = hash_file(algo, path)
+        if h == "" is
+            write(red_text("error:") + " unsupported algorithm '" + algo + "'")
+            exit(1)
+        end
+        write(h + "  " + path)
+        return
+    end
+
+    if cmd == "hmac" is
+        let algo: string = positional(args, 2)
+        let key: string = positional(args, 3)
+        let msg: string = positional(args, 4)
+        if algo == "sha512" is
+            write(hmac_sha512(key, msg))
+        else is
+            write(hmac_sha256(key, msg))
+        end
+        return
+    end
+
+    if cmd == "verify" is
+        let path: string = positional(args, 2)
+        let expected: string = to_lower(positional(args, 3))
+        let algo: string = guess_algo(expected)
+        if algo == "" is
+            write(red_text("error:") + " cannot guess algorithm from hash length")
+            exit(1)
+        end
+        let actual: string = hash_file(algo, path)
+        if actual == expected is
+            write(green_text("MATCH") + "  " + algo + "  " + path)
+            return
+        end
+        write(red_text("MISMATCH") + "  " + algo)
+        write("  expected: " + expected)
+        write("  actual:   " + actual)
+        exit(2)
+    end
+
+    if cmd == "id" is
+        write(identify(positional(args, 2)))
+        return
+    end
+
+    if cmd == "entropy" is
+        let file: string = arg_val(args, "--file", "")
+        let mut e: string = ""
+        if file != "" is
+            e = entropy_cmd("cat " + shquote(file))
+        else is
+            e = entropy_cmd("printf %s " + shquote(positional(args, 2)))
+        end
+        write(e + " bits/byte  —  " + verdict(e))
+        return
+    end
+
+    if cmd == "hex" is
+        let mode: string = positional(args, 2)
+        let text: string = positional(args, 3)
+        if mode == "enc" is
+            write(hex_encode(text))
+        else is
+            write(hex_decode(text))
+        end
+        return
+    end
+
+    if cmd == "b64" is
+        let mode: string = positional(args, 2)
+        let text: string = positional(args, 3)
+        if mode == "enc" is
+            write(sh("printf %s " + shquote(text) + " | base64 -w0"))
+        else is
+            write(sh("printf %s " + shquote(text) + " | base64 -d 2>/dev/null"))
+        end
+        return
+    end
+
+    if cmd == "rand" is
+        let n: int? = parse_int(positional(args, 2))
+        let mut count: int = 32
+        match n is
+            nil => count = 32
+            v => count = v
+        end
+        write(sh("head -c " + to_string(count) + " /dev/urandom | od -An -tx1 | tr -d ' \\n'"))
+        return
+    end
+
+    if cmd == "uuid" is
+        write(new_uuid())
+        return
+    end
+
+    usage()
+    exit(1)
+end
