@@ -1,0 +1,267 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; hdrcheck — HTTP security header & cookie audit (needs curl)
+;; Usage: hdrcheck <url> [--insecure]
+
+fn usage() is
+    banner("hdrcheck", "0.2.0", "HTTP security headers audit")
+    write("  hdrcheck <url> [--insecure] [--ua=string]")
+end
+
+fn header_of(headers: string, name: string) -> string is
+    let lines: [string] = split(headers, "\n")
+    let key: string = to_lower(name) + ":"
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = trim(lines[i])
+        if starts_with(to_lower(l), key) is
+            return trim(string_slice(l, string_len(key), string_len(l)))
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn need(headers: string, name: string, why: string, level: int) -> int is
+    let v: string = header_of(headers, name)
+    if v != "" is
+        return ok_line(name + ": " + v)
+    end
+    if level == 2 is
+        return bad_line(name + " missing — " + why)
+    end
+    return warn_line(name + " missing — " + why)
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let url: string = positional(args, 1)
+    if url == "" || arg_has(args, "--help") is
+        usage()
+        return
+    end
+    if !have_cmd("curl") is
+        write(red_text("error:") + " curl not found")
+        exit(1)
+    end
+    let mut flags: string = "-sS -I -L --max-time 12 --max-redirs 5"
+    if arg_has(args, "--insecure") is
+        flags = flags + " -k"
+    end
+    let ua: string = arg_val(args, "--ua", "hdrcheck/0.2 (HackerOS)")
+    banner("hdrcheck", "0.2.0", url)
+    let raw: string = shell("curl " + flags + " -A " + shquote(ua) + " " + shquote(url) + " 2>&1")
+    if !contains(raw, "HTTP/") is
+        bad_line("no HTTP response: " + trim(raw))
+        exit(2)
+    end
+    ;; keep only the final response block
+    let blocks: [string] = split(replace(raw, "\r", ""), "\n\n")
+    let mut last: string = ""
+    let mut i: int = 0
+    while i < array_len(blocks) is
+        if contains(blocks[i], "HTTP/") is
+            last = blocks[i]
+        end
+        i += 1
+    end
+    info_line(trim(split(last, "\n")[0]))
+    let https: bool = starts_with(url, "https://")
+    let mut warns: int = 0
+    let mut fails: int = 0
+    let mut checks: int = 0
+    let mut sev: int = 0
+    let mut t: [int] = [0, 0]
+
+    if https is
+        sev = need(last, "Strict-Transport-Security", "enables HSTS", 2)
+    else is
+        sev = bad_line("URL is plain HTTP — no transport security")
+    end
+    checks += 1
+    t = tally(sev, warns, fails)
+    warns = t[0]
+    fails = t[1]
+
+    let names: [string] = ["Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"]
+    let why: [string] = ["mitigates XSS / injection", "clickjacking (or CSP frame-ancestors)", "stops MIME sniffing (nosniff)", "limits referrer leakage", "restricts browser features", "isolates browsing context"]
+    let levels: [int] = [2, 1, 2, 1, 1, 1]
+    i = 0
+    while i < array_len(names) is
+        sev = need(last, names[i], why[i], levels[i])
+        checks += 1
+        t = tally(sev, warns, fails)
+        warns = t[0]
+        fails = t[1]
+        i += 1
+    end
+
+    ;; information disclosure
+    let srv: string = header_of(last, "Server")
+    let pw: string = header_of(last, "X-Powered-By")
+    checks += 1
+    if pw != "" is
+        warns += 1
+        warn_line("X-Powered-By discloses stack: " + pw)
+    else is
+        ok_line("no X-Powered-By header")
+    end
+    checks += 1
+    if srv != "" && re_match("[0-9]+\\.[0-9]+", srv) is
+        warns += 1
+        warn_line("Server header reveals version: " + srv)
+    else is
+        ok_line("Server header: " + (if srv == "" then "(absent)" else srv end))
+    end
+
+    ;; cookies
+    let cookies: [string] = split(last, "\n")
+    i = 0
+    while i < array_len(cookies) is
+        let l: string = trim(cookies[i])
+        if starts_with(to_lower(l), "set-cookie:") is
+            checks += 1
+            let low: string = to_lower(l)
+            let nm: string = trim(split(string_slice(l, 11, string_len(l)), "=")[0])
+            let mut missing: string = ""
+            if !contains(low, "secure") && https is missing = missing + " Secure" end
+            if !contains(low, "httponly") is missing = missing + " HttpOnly" end
+            if !contains(low, "samesite") is missing = missing + " SameSite" end
+            if missing == "" is
+                ok_line("cookie " + nm + ": Secure/HttpOnly/SameSite set")
+            else is
+                warns += 1
+                warn_line("cookie " + nm + " lacks:" + missing)
+            end
+        end
+        i += 1
+    end
+    exit(summary("hdrcheck", checks, warns, fails))
+end
