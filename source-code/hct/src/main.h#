@@ -1,1 +1,540 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
 
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; hct — HackerOS Cybersecurity Tools: containerised tool manager
+;; `hct install metasploit`, then `hct metasploit` (or just `msfconsole` via a shim)
+;; works like a native tool: current directory mounted at /work, data persisted.
+
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+;; name|image|command|flags|data-mount|description
+;; flags: n = --net=host · r = NET_RAW+NET_ADMIN caps · t = needs tty
+fn builtin_registry() -> [string] is
+    return [
+        "metasploit|docker.io/metasploitframework/metasploit-framework:latest|msfconsole|nt|/home/msf/.msf4|Metasploit Framework console",
+        "msfvenom|docker.io/metasploitframework/metasploit-framework:latest|msfvenom|n|/home/msf/.msf4|Metasploit payload generator (own test labs)",
+        "nmap|docker.io/instrumentisto/nmap:latest||nr|/root|Network scanner (image entrypoint = nmap)",
+        "nikto|docker.io/sullo/nikto:latest||n|/root|Web server scanner",
+        "sqlmap|docker.io/sqlmapproject/sqlmap:latest||n|/root/.local/share/sqlmap|SQL injection tester (authorized targets)",
+        "wpscan|docker.io/wpscanteam/wpscan:latest||n|/wpscan|WordPress security scanner",
+        "nuclei|docker.io/projectdiscovery/nuclei:latest||n|/root/.config/nuclei|Template-based vulnerability scanner",
+        "httpx|docker.io/projectdiscovery/httpx:latest||n|/root|HTTP probing toolkit",
+        "subfinder|docker.io/projectdiscovery/subfinder:latest||n|/root/.config/subfinder|Passive subdomain discovery",
+        "zap|docker.io/zaproxy/zap-stable:latest|zap.sh|nt|/home/zap/.ZAP|OWASP ZAP web app scanner",
+        "rustscan|docker.io/rustscan/rustscan:latest||nr|/root|Fast port scanner",
+        "trivy|docker.io/aquasec/trivy:latest||n|/root/.cache/trivy|Container / filesystem vulnerability scanner",
+        "gitleaks|docker.io/zricethezav/gitleaks:latest||n|/root|Secret scanner for git repositories",
+        "kali|docker.io/kalilinux/kali-rolling:latest|bash|nrt|/root|Kali Linux userland (apt install anything)",
+        "blackarch|docker.io/blackarch/blackarch:latest|bash|nrt|/root|BlackArch userland",
+        "cyberchef|ghcr.io/gchq/cyberchef:latest||n|/root|CyberChef web UI on http://localhost:8000"
+    ]
+end
+
+fn usage() is
+    banner("hct", "0.2.0", "HackerOS Tools Cybersecurity — containers as native tools")
+    write("  hct list                     tools you can install (✔ = installed)")
+    write("  hct search <word>            search the registry")
+    write("  hct install <tool> [--shim] pull the image (+ create ~/.local/bin/<tool>)")
+    write("  hct run <tool> [args...]     run a tool (also: hct <tool> [args...])")
+    write("  hct shell <tool>             interactive shell inside the tool image")
+    write("  hct shim <tool> | unshim <tool>   create / remove a command-name wrapper")
+    write("  hct update [tool]            pull newer images")
+    write("  hct remove <tool>            remove image, shim and (--purge) data")
+    write("  hct add <name> <image> [cmd] register your own containerised tool")
+    write("  hct info <tool>              image, mounts and the exact command line")
+    write("  hct doctor                   engine, rootless mode, network")
+    write("")
+    write(dim_text("  options: --engine=podman|docker  --dry-run (print command)  --no-net  --no-mount"))
+    write(dim_text("  Use only against systems you own or are authorised to test."))
+end
+
+fn custom_file() -> string is
+    return state_dir("hct") + "/custom.db"
+end
+
+fn registry() -> [string] is
+    let mut all: [string] = builtin_registry()
+    let c: string = read_or(custom_file(), "")
+    if c != "" is
+        let lines: [string] = split(c, "\n")
+        let mut i: int = 0
+        while i < array_len(lines) is
+            if string_len(trim(lines[i])) > 0 is
+                all = array_push(all, trim(lines[i]))
+            end
+            i += 1
+        end
+    end
+    return all
+end
+
+;; "" when not found
+fn lookup(name: string) -> string is
+    let reg: [string] = registry()
+    let mut i: int = array_len(reg) - 1
+    while i >= 0 is
+        let f: [string] = split(reg[i], "|")
+        if f[0] == name is
+            return reg[i]
+        end
+        i -= 1
+    end
+    return ""
+end
+
+fn engine(args: [string]) -> string is
+    let forced: string = arg_val(args, "--engine", env_get("HCT_ENGINE"))
+    if forced != "" is
+        return forced
+    end
+    if have_cmd("podman") is
+        return "podman"
+    end
+    if have_cmd("docker") is
+        return "docker"
+    end
+    return ""
+end
+
+fn image_present(eng: string, image: string) -> bool is
+    let r: string = sh(eng + " image exists " + shquote(image) + " >/dev/null 2>&1 && echo y || (" + eng + " image inspect " + shquote(image) + " >/dev/null 2>&1 && echo y || echo n)")
+    return r == "y"
+end
+
+fn data_dir(name: string) -> string is
+    let d: string = state_dir("hct") + "/data/" + name
+    fs_mkdir_all(d)
+    return d
+end
+
+;; Build `<engine> run ...` for a registry entry.
+fn run_line(eng: string, entry: string, tool_args: [string], opts: [string], interactive: bool) -> string is
+    let f: [string] = split(entry, "|")
+    let name: string = f[0]
+    let image: string = f[1]
+    let cmd: string = f[2]
+    let flags: string = f[3]
+    let datam: string = f[4]
+    let mut line: string = eng + " run --rm"
+    if interactive || contains(flags, "t") is
+        line = line + " $([ -t 0 ] && echo -it || echo -i)"
+    else is
+        line = line + " -i"
+    end
+    if contains(flags, "n") && !arg_has(opts, "--no-net") is
+        line = line + " --net=host"
+    end
+    if contains(flags, "r") is
+        line = line + " --cap-add=NET_RAW --cap-add=NET_ADMIN"
+    end
+    if !arg_has(opts, "--no-mount") is
+        line = line + " -v " + shquote(fs_cwd() + ":/work") + " -w /work"
+    end
+    if datam != "" is
+        line = line + " -v " + shquote(data_dir(name) + ":" + datam)
+    end
+    line = line + " --name hct-" + name + "-" + to_string(getpid())
+    if cmd != "" && !contains(cmd, " ") is
+        line = line + " --entrypoint " + shquote(cmd)
+    end
+    line = line + " " + shquote(image)
+    let mut i: int = 0
+    while i < array_len(tool_args) is
+        line = line + " " + shquote(tool_args[i])
+        i += 1
+    end
+    return line
+end
+
+fn do_list(args: [string], filter: string) is
+    banner("hct list", "0.2.0", "registry")
+    let eng: string = engine(args)
+    let reg: [string] = registry()
+    let mut i: int = 0
+    while i < array_len(reg) is
+        let f: [string] = split(reg[i], "|")
+        let hay: string = to_lower(f[0] + " " + f[5])
+        if filter == "" || contains(hay, to_lower(filter)) is
+            let mut mark: string = dim_text("·")
+            if eng != "" && image_present(eng, f[1]) is
+                mark = green_text("✔")
+            end
+            write("  " + mark + " " + bold(string_pad_right(f[0], 12)) + f[5])
+        end
+        i += 1
+    end
+end
+
+fn do_shim(name: string) -> int is
+    let dir: string = home_dir() + "/.local/bin"
+    fs_mkdir_all(dir)
+    let path: string = dir + "/" + name
+    let script: string = "#!/bin/sh\n;; generated by hct — containerised " + name + "\nexec hct run " + name + " \"$@\"\n"
+    fs_write(path, replace(script, ";; ", "# "))
+    sh("chmod +x " + shquote(path))
+    write("  " + green_text("shim") + "  " + path)
+    if !contains(env_get("PATH"), dir) is
+        write(dim_text("  add " + dir + " to PATH to call '" + name + "' directly"))
+    end
+    return 0
+end
+
+fn do_run(args: [string], name: string, tool_args: [string], interactive: bool) -> int is
+    let entry: string = lookup(name)
+    if entry == "" is
+        write(red_text("error:") + " unknown tool '" + name + "' — see: hct list")
+        return 1
+    end
+    let eng: string = engine(args)
+    let f: [string] = split(entry, "|")
+    let line: string = run_line(eng, entry, tool_args, args, interactive)
+    if arg_has(args, "--dry-run") is
+        write(line)
+        return 0
+    end
+    if eng == "" is
+        write(red_text("error:") + " no container engine — install podman (recommended) or docker")
+        return 1
+    end
+    if !image_present(eng, f[1]) is
+        write(dim_text("  image missing — pulling " + f[1]))
+        let rc: int = system(eng + " pull " + shquote(f[1]))
+        if rc != 0 is
+            write(red_text("error:") + " pull failed")
+            return rc
+        end
+    end
+    return system(line)
+end
+
+;; args after the tool name, minus hct's own options
+fn tool_args_from(args: [string], start: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = start
+    while i < array_len(args) is
+        let a: string = args[i]
+        if a != "--dry-run" && a != "--no-net" && a != "--no-mount" && !starts_with(a, "--engine=") is
+            out = array_push(out, a)
+        end
+        i += 1
+    end
+    return out
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || cmd == "help" || cmd == "--help" || cmd == "-h" is
+        usage()
+        return
+    end
+    let eng: string = engine(args)
+
+    if cmd == "list" is
+        do_list(args, "")
+        return
+    end
+    if cmd == "search" is
+        do_list(args, positional(args, 2))
+        return
+    end
+
+    if cmd == "install" is
+        let name: string = positional(args, 2)
+        let entry: string = lookup(name)
+        if entry == "" is
+            write(red_text("error:") + " unknown tool '" + name + "'")
+            exit(1)
+        end
+        let f: [string] = split(entry, "|")
+        if arg_has(args, "--dry-run") is
+            write(eng + " pull " + f[1])
+            return
+        end
+        if eng == "" is
+            write(red_text("error:") + " no container engine found")
+            exit(1)
+        end
+        write(cyan_text("  pulling ") + f[1])
+        let rc: int = system(eng + " pull " + shquote(f[1]))
+        if rc != 0 is
+            exit(rc)
+        end
+        if arg_has(args, "--shim") is
+            do_shim(name)
+        end
+        write(green_text("  installed ") + name + dim_text("  →  hct " + name))
+        return
+    end
+
+    if cmd == "run" is
+        let name: string = positional(args, 2)
+        exit(do_run(args, name, tool_args_from(args, 3), false))
+    end
+
+    if cmd == "shell" is
+        let name: string = positional(args, 2)
+        let entry: string = lookup(name)
+        if entry == "" is
+            write(red_text("error:") + " unknown tool '" + name + "'")
+            exit(1)
+        end
+        let f: [string] = split(entry, "|")
+        let sh_entry: string = f[0] + "|" + f[1] + "|sh|" + f[3] + "|" + f[4] + "|" + f[5]
+        let line: string = run_line(eng, sh_entry, [], args, true)
+        if arg_has(args, "--dry-run") is
+            write(line)
+            return
+        end
+        exit(system(line))
+    end
+
+    if cmd == "shim" is
+        exit(do_shim(positional(args, 2)))
+    end
+    if cmd == "unshim" is
+        let p: string = home_dir() + "/.local/bin/" + positional(args, 2)
+        if fs_exists(p) && contains(read_or(p, ""), "generated by hct") is
+            fs_remove(p)
+            write(green_text("  removed ") + p)
+        else is
+            write(yellow_text("  not an hct shim: ") + p)
+        end
+        return
+    end
+
+    if cmd == "update" is
+        let only: string = positional(args, 2)
+        let reg: [string] = registry()
+        let mut i: int = 0
+        while i < array_len(reg) is
+            let f: [string] = split(reg[i], "|")
+            if (only == "" && eng != "" && image_present(eng, f[1])) || only == f[0] is
+                write(cyan_text("  updating ") + f[0])
+                if !arg_has(args, "--dry-run") is
+                    system(eng + " pull " + shquote(f[1]))
+                else is
+                    write(eng + " pull " + f[1])
+                end
+            end
+            i += 1
+        end
+        return
+    end
+
+    if cmd == "remove" is
+        let name: string = positional(args, 2)
+        let entry: string = lookup(name)
+        if entry == "" is
+            write(red_text("error:") + " unknown tool '" + name + "'")
+            exit(1)
+        end
+        let f: [string] = split(entry, "|")
+        if !arg_has(args, "--dry-run") is
+            system(eng + " rmi " + shquote(f[1]) + " 2>/dev/null")
+            let p: string = home_dir() + "/.local/bin/" + name
+            if fs_exists(p) && contains(read_or(p, ""), "generated by hct") is
+                fs_remove(p)
+            end
+            if arg_has(args, "--purge") is
+                fs_rmdir_all(state_dir("hct") + "/data/" + name)
+            end
+        end
+        write(green_text("  removed ") + name)
+        return
+    end
+
+    if cmd == "add" is
+        let name: string = positional(args, 2)
+        let image: string = positional(args, 3)
+        let c: string = positional(args, 4)
+        if name == "" || image == "" is
+            usage()
+            exit(1)
+        end
+        fs_append(custom_file(), name + "|" + image + "|" + c + "|n|/root|custom tool\n")
+        write(green_text("  registered ") + name + " → " + image)
+        return
+    end
+
+    if cmd == "info" is
+        let name: string = positional(args, 2)
+        let entry: string = lookup(name)
+        if entry == "" is
+            write(red_text("error:") + " unknown tool '" + name + "'")
+            exit(1)
+        end
+        let f: [string] = split(entry, "|")
+        banner("hct info", "0.2.0", name)
+        write("  image     " + f[1])
+        write("  command   " + (if f[2] == "" then "(image entrypoint)" else f[2] end))
+        write("  data      " + data_dir(name) + "  →  " + f[4])
+        write("  workdir   " + fs_cwd() + "  →  /work")
+        write("  run line  " + run_line(eng, entry, ["<args>"], args, false))
+        return
+    end
+
+    if cmd == "doctor" is
+        banner("hct doctor", "0.2.0", "environment")
+        let mut w: int = 0
+        let mut f: int = 0
+        if eng == "" is
+            f += 1
+            bad_line("no podman / docker in PATH")
+        else is
+            ok_line("engine: " + eng + " " + sh(eng + " --version 2>/dev/null"))
+            if eng == "podman" is
+                if sh("podman info --format '{{{{.Host.Security.Rootless}}}}' 2>/dev/null") == "true" is
+                    ok_line("rootless mode (recommended)")
+                else is
+                    w += 1
+                    warn_line("running as root — prefer rootless podman")
+                end
+            end
+        end
+        if fs_exists(home_dir() + "/.local/bin") && contains(env_get("PATH"), ".local/bin") is
+            ok_line("~/.local/bin is in PATH (shims work)")
+        else is
+            w += 1
+            warn_line("~/.local/bin not in PATH — shims will not be found")
+        end
+        exit(summary("hct doctor", 3, w, f))
+    end
+
+    ;; hct <tool> [args...]  — shorthand for run
+    if lookup(cmd) != "" is
+        exit(do_run(args, cmd, tool_args_from(args, 2), false))
+    end
+
+    write(red_text("error:") + " unknown command or tool '" + cmd + "'")
+    usage()
+    exit(1)
+end
