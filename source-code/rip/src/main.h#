@@ -1,1 +1,311 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
 
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; rip — Recon IP: IPv4/CIDR calculator, classifier and DNS helper
+;; Usage: rip <cidr|expand|class|rdns|resolve|range> ...
+
+fn usage() is
+    banner("rip", "0.2.0", "IPv4 / CIDR / DNS helper")
+    write("  rip cidr <a.b.c.d/n>        network, mask, broadcast, host range, count")
+    write("  rip expand <a.b.c.d/n>      list every host (max 4096)")
+    write("  rip class <a.b.c.d>         private / loopback / link-local / CGNAT / ...")
+    write("  rip rdns <ip>               reverse DNS (PTR)")
+    write("  rip resolve <host>          forward DNS (A / AAAA)")
+    write("  rip range <start> <end>     number of addresses in an inclusive range")
+end
+
+fn ip_to_int(ip: string) -> int is
+    let p: [string] = split(ip, ".")
+    if array_len(p) != 4 is
+        return -1
+    end
+    let mut out: int = 0
+    let mut i: int = 0
+    while i < 4 is
+        let o: int? = parse_int(p[i])
+        match o is
+            nil => return -1
+            v => is
+                if v < 0 || v > 255 is
+                    return -1
+                end
+                out = (out << 8) | v
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn int_to_ip(n: int) -> string is
+    return to_string((n >> 24) & 255) + "." + to_string((n >> 16) & 255) + "." + to_string((n >> 8) & 255) + "." + to_string(n & 255)
+end
+
+fn mask_of(bits: int) -> int is
+    if bits <= 0 is
+        return 0
+    end
+    return (4294967295 << (32 - bits)) & 4294967295
+end
+
+fn classify(n: int) -> string is
+    let a: int = (n >> 24) & 255
+    let b: int = (n >> 16) & 255
+    if a == 10 is return "private (RFC 1918, 10/8)" end
+    if a == 172 && b >= 16 && b <= 31 is return "private (RFC 1918, 172.16/12)" end
+    if a == 192 && b == 168 is return "private (RFC 1918, 192.168/16)" end
+    if a == 127 is return "loopback (127/8)" end
+    if a == 169 && b == 254 is return "link-local (169.254/16)" end
+    if a == 100 && b >= 64 && b <= 127 is return "shared address space / CGNAT (100.64/10)" end
+    if a >= 224 && a <= 239 is return "multicast (224/4)" end
+    if a >= 240 is return "reserved / broadcast (240/4)" end
+    if a == 0 is return "this-network (0/8)" end
+    if a == 192 && b == 0 is return "IETF protocol / documentation (192.0.0/24 & 192.0.2/24)" end
+    return "public / globally routable"
+end
+
+fn parse_cidr(s: string) -> [int] is
+    let p: [string] = split(s, "/")
+    let ip: int = ip_to_int(p[0])
+    let mut bits: int = 32
+    if array_len(p) > 1 is
+        let b: int? = parse_int(p[1])
+        match b is
+            nil => bits = -1
+            v => bits = v
+        end
+    end
+    return [ip, bits]
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if cmd == "" || arg_has(args, "--help") is
+        usage()
+        return
+    end
+
+    if cmd == "cidr" || cmd == "expand" is
+        let c: [int] = parse_cidr(positional(args, 2))
+        let ip: int = c[0]
+        let bits: int = c[1]
+        if ip < 0 || bits < 0 || bits > 32 is
+            write(red_text("error:") + " expected a.b.c.d/n")
+            exit(1)
+        end
+        let mask: int = mask_of(bits)
+        let net: int = ip & mask
+        let bcast: int = net | (mask ^ 4294967295)
+        let mut hosts: int = 0
+        if bits <= 30 is
+            hosts = bcast - net - 1
+        elsif bits == 31 is
+            hosts = 2
+        else is
+            hosts = 1
+        end
+        if cmd == "cidr" is
+            banner("rip cidr", "0.2.0", positional(args, 2))
+            write("  network    " + int_to_ip(net))
+            write("  netmask    " + int_to_ip(mask))
+            write("  wildcard   " + int_to_ip(mask ^ 4294967295))
+            write("  broadcast  " + int_to_ip(bcast))
+            if bits <= 30 is
+                write("  first host " + int_to_ip(net + 1))
+                write("  last host  " + int_to_ip(bcast - 1))
+            end
+            write("  usable     " + to_string(hosts))
+            write("  class      " + classify(net))
+            return
+        end
+        let mut first: int = net
+        let mut last: int = bcast
+        if bits <= 30 is
+            first = net + 1
+            last = bcast - 1
+        end
+        if last - first + 1 > 4096 is
+            write(red_text("error:") + " range larger than 4096 addresses; use a longer prefix")
+            exit(1)
+        end
+        let mut i: int = first
+        while i <= last is
+            write(int_to_ip(i))
+            i += 1
+        end
+        return
+    end
+
+    if cmd == "class" is
+        let n: int = ip_to_int(positional(args, 2))
+        if n < 0 is
+            write(red_text("error:") + " invalid IPv4 address")
+            exit(1)
+        end
+        write(classify(n))
+        return
+    end
+
+    if cmd == "range" is
+        let a: int = ip_to_int(positional(args, 2))
+        let b: int = ip_to_int(positional(args, 3))
+        if a < 0 || b < 0 || b < a is
+            write(red_text("error:") + " invalid range")
+            exit(1)
+        end
+        write(to_string(b - a + 1) + " addresses")
+        return
+    end
+
+    if cmd == "rdns" is
+        let ip: string = positional(args, 2)
+        let r: string = sh("getent hosts " + shquote(ip) + " 2>/dev/null | awk '{print $2}' | head -1")
+        if r == "" is
+            write(dim_text("no PTR record"))
+            exit(1)
+        end
+        write(r)
+        return
+    end
+
+    if cmd == "resolve" is
+        let host: string = positional(args, 2)
+        let r: string = sh("getent ahosts " + shquote(host) + " 2>/dev/null | awk '{print $1}' | sort -u")
+        if r == "" is
+            write(red_text("NXDOMAIN / no answer"))
+            exit(1)
+        end
+        write(r)
+        return
+    end
+
+    usage()
+    exit(1)
+end
