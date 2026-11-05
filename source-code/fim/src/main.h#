@@ -1,0 +1,253 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; fim — File Integrity Monitor (SHA-256 manifests, baseline & check)
+;; Usage: fim init <dir> | check <dir> | update <dir> | list
+
+fn usage() is
+    banner("fim", "0.2.0", "file integrity monitor")
+    write("  fim init <dir> [--exclude=glob]  create baseline manifest (sha256 + mode + owner)")
+    write("  fim check <dir>                  report modified / new / deleted files")
+    write("  fim update <dir>                 accept the current state as the new baseline")
+    write("  fim list                         known baselines")
+end
+
+fn manifest_path(dir: string) -> string is
+    let real: string = sh("realpath " + shquote(dir) + " 2>/dev/null")
+    let id: string = replace(replace(real, "/", "_"), " ", "_")
+    return state_dir("fim") + "/" + id + ".manifest"
+end
+
+fn build_manifest(dir: string, exclude: string) -> string is
+    let mut ex: string = "-not -path '*/.git/*'"
+    if exclude != "" is
+        ex = ex + " -not -name " + shquote(exclude)
+    end
+    let cmd: string = "find " + shquote(dir) + " -type f " + ex + " -print0 2>/dev/null | sort -z | xargs -0 -r -n 64 stat -c '%n|%a|%U:%G|%s' "
+    ;; hash and stat joined per path
+    let script: string = "find " + shquote(dir) + " -type f " + ex + " -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do printf '%s|%s|%s\\n' \"$(sha256sum \"$f\" 2>/dev/null | cut -d' ' -f1)\" \"$(stat -c '%a|%U:%G' \"$f\" 2>/dev/null)\" \"$f\"; done"
+    return shell("bash -c " + shquote(script))
+end
+
+;; manifest line: hash|mode|owner:group|path
+fn path_of(line: string) -> string is
+    let p: [string] = split(line, "|")
+    if array_len(p) < 4 is
+        return ""
+    end
+    return p[3]
+end
+
+fn find_line(lines: [string], path: string) -> string is
+    let mut i: int = 0
+    while i < array_len(lines) is
+        if path_of(lines[i]) == path is
+            return lines[i]
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    let dir: string = positional(args, 2)
+    if cmd == "" || arg_has(args, "--help") is
+        usage()
+        return
+    end
+    if cmd == "list" is
+        banner("fim list", "0.2.0", "baselines")
+        write(sh("ls -1 " + shquote(state_dir("fim")) + " 2>/dev/null | sed 's/\\.manifest$//; s/^_/\\//; s/_/\\//g'"))
+        return
+    end
+    if dir == "" || !fs_is_dir(dir) is
+        write(red_text("error:") + " directory required")
+        exit(1)
+    end
+    let mf: string = manifest_path(dir)
+    if cmd == "init" || cmd == "update" is
+        banner("fim " + cmd, "0.2.0", dir)
+        let m: string = build_manifest(dir, arg_val(args, "--exclude", ""))
+        fs_write(mf, m)
+        write("  " + green_text("baseline written") + "  " + to_string(array_len(split(trim(m), "\n"))) + " files → " + mf)
+        return
+    end
+    if cmd != "check" is
+        usage()
+        exit(1)
+    end
+    banner("fim check", "0.2.0", dir)
+    if !fs_exists(mf) is
+        write(red_text("error:") + " no baseline — run: fim init " + dir)
+        exit(1)
+    end
+    let old: [string] = split(trim(fs_read(mf)), "\n")
+    let now: [string] = split(trim(build_manifest(dir, "")), "\n")
+    let mut changes: int = 0
+    let mut i: int = 0
+    while i < array_len(now) is
+        let n: string = now[i]
+        let p: string = path_of(n)
+        if p != "" is
+            let o: string = find_line(old, p)
+            if o == "" is
+                write("  " + yellow_text("NEW      ") + p)
+                changes += 1
+            elsif o != n is
+                let of: [string] = split(o, "|")
+                let nf: [string] = split(n, "|")
+                let mut what: string = ""
+                if of[0] != nf[0] is what = what + " content" end
+                if of[1] != nf[1] is what = what + " mode(" + of[1] + "→" + nf[1] + ")" end
+                if of[2] != nf[2] is what = what + " owner(" + of[2] + "→" + nf[2] + ")" end
+                write("  " + red_text("MODIFIED ") + p + dim_text("  [" + trim(what) + "]"))
+                changes += 1
+            end
+        end
+        i += 1
+    end
+    i = 0
+    while i < array_len(old) is
+        let p: string = path_of(old[i])
+        if p != "" && find_line(now, p) == "" is
+            write("  " + red_text("DELETED  ") + p)
+            changes += 1
+        end
+        i += 1
+    end
+    if changes == 0 is
+        write("  " + green_text("all " + to_string(array_len(now)) + " files match the baseline"))
+        return
+    end
+    write(dim_text("  " + string_repeat("─", 58)))
+    write("  " + red_text(to_string(changes) + " change(s)"))
+    exit(2)
+end
