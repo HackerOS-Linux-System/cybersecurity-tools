@@ -1,0 +1,313 @@
+using "2026"
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
+;; Authorized testing only: run these tools against systems you own or are
+;; explicitly permitted to assess.
+
+fn sh(cmd: string) -> string is
+    return trim(shell(cmd))
+end
+
+fn have_cmd(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
+    end
+    return dflt
+end
+
+;; n-th positional argument (1-based, flags and their values are not skipped
+;; smartly: a positional is any arg that does not start with "-")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn ok_line(msg: string) -> int is
+    write("  " + green_text("PASS") + "  " + msg)
+    return 0
+end
+
+fn warn_line(msg: string) -> int is
+    write("  " + yellow_text("WARN") + "  " + msg)
+    return 1
+end
+
+fn bad_line(msg: string) -> int is
+    write("  " + red_text("FAIL") + "  " + msg)
+    return 2
+end
+
+fn info_line(msg: string) is
+    write("  " + cyan_text("INFO") + "  " + msg)
+end
+
+;; severity accumulator: 0 ok, 1 warn, 2 fail  → counts
+fn tally(sev: int, warns: int, fails: int) -> [int] is
+    let mut w: int = warns
+    let mut f: int = fails
+    if sev == 1 is
+        w += 1
+    end
+    if sev == 2 is
+        f += 1
+    end
+    return [w, f]
+end
+
+fn summary(tool: string, checks: int, warns: int, fails: int) -> int is
+    write(dim_text("  " + string_repeat("─", 58)))
+    let line: string = tool + ": " + to_string(checks) + " checks, " + to_string(warns) + " warnings, " + to_string(fails) + " failures"
+    if fails > 0 is
+        write("  " + red_text(line))
+        return 2
+    end
+    if warns > 0 is
+        write("  " + yellow_text(line))
+        return 1
+    end
+    write("  " + green_text(line))
+    return 0
+end
+
+fn read_or(path: string, dflt: string) -> string is
+    if fs_exists(path) is
+        return fs_read(path)
+    end
+    return dflt
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+fn state_dir(tool: string) -> string is
+    let d: string = home_dir() + "/.hackeros/" + tool
+    fs_mkdir_all(d)
+    return d
+end
+
+;; portwatch — TCP connect scanner with baseline diff (alerts on newly opened ports)
+;; Usage: portwatch scan <host> [--ports=1-1024|22,80,443|top] [--timeout=300] [--baseline]
+
+fn usage() is
+    banner("portwatch", "0.2.0", "TCP port scanner + baseline diff")
+    write("  portwatch scan <host> [--ports=1-1024|22,80,443|top] [--timeout=ms] [--baseline]")
+    write("  portwatch diff <host>        compare the last scan with the saved baseline")
+    write(dim_text("  Scan only hosts you own or are authorised to test."))
+end
+
+fn service_name(p: int) -> string is
+    if p == 21 is return "ftp" end
+    if p == 22 is return "ssh" end
+    if p == 23 is return "telnet" end
+    if p == 25 is return "smtp" end
+    if p == 53 is return "dns" end
+    if p == 80 is return "http" end
+    if p == 110 is return "pop3" end
+    if p == 111 is return "rpcbind" end
+    if p == 123 is return "ntp" end
+    if p == 139 is return "netbios" end
+    if p == 143 is return "imap" end
+    if p == 443 is return "https" end
+    if p == 445 is return "smb" end
+    if p == 631 is return "ipp" end
+    if p == 993 is return "imaps" end
+    if p == 995 is return "pop3s" end
+    if p == 1433 is return "mssql" end
+    if p == 1883 is return "mqtt" end
+    if p == 2375 is return "docker-api (UNAUTHENTICATED!)" end
+    if p == 3306 is return "mysql" end
+    if p == 3389 is return "rdp" end
+    if p == 5432 is return "postgres" end
+    if p == 5900 is return "vnc" end
+    if p == 6379 is return "redis" end
+    if p == 8080 is return "http-alt" end
+    if p == 8443 is return "https-alt" end
+    if p == 9200 is return "elasticsearch" end
+    if p == 27017 is return "mongodb" end
+    return "-"
+end
+
+fn risky(p: int) -> bool is
+    return p == 23 || p == 21 || p == 111 || p == 139 || p == 445 || p == 2375 || p == 3389 || p == 5900 || p == 6379 || p == 9200 || p == 27017
+end
+
+;; expands "1-100,443,8000-8010" or "top"
+fn expand_ports(spec: string) -> [int] is
+    let mut s: string = spec
+    if spec == "top" is
+        s = "21-23,25,53,80,110,111,123,139,143,443,445,631,993,995,1433,1883,2375,3306,3389,5432,5900,6379,8080,8443,9200,27017"
+    end
+    let mut out: [int] = []
+    let parts: [string] = split(s, ",")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let seg: [string] = split(parts[i], "-")
+        let a: int? = parse_int(seg[0])
+        match a is
+            nil => skip()
+            lo => is
+                let mut hi: int = lo
+                if array_len(seg) > 1 is
+                    let b: int? = parse_int(seg[1])
+                    match b is
+                        nil => hi = lo
+                        v => hi = v
+                    end
+                end
+                let mut p: int = lo
+                while p <= hi && p <= 65535 is
+                    out = array_push(out, p)
+                    p += 1
+                end
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn last_file(host: string) -> string is
+    return state_dir("portwatch") + "/" + replace(host, "/", "_") + ".last"
+end
+
+fn base_file(host: string) -> string is
+    return state_dir("portwatch") + "/" + replace(host, "/", "_") + ".base"
+end
+
+fn diff_ports(host: string) -> int is
+    let base: string = read_or(base_file(host), "")
+    let last: string = read_or(last_file(host), "")
+    if base == "" is
+        write(yellow_text("  no baseline for " + host) + dim_text("  (run scan with --baseline)"))
+        return 1
+    end
+    let bl: [string] = split(trim(base), "\n")
+    let ll: [string] = split(trim(last), "\n")
+    let mut changes: int = 0
+    let mut i: int = 0
+    while i < array_len(ll) is
+        if ll[i] != "" && !array_contains(bl, ll[i]) is
+            write("  " + red_text("+ NEW   ") + ll[i] + "/tcp  " + service_name(to_int(ll[i])))
+            changes += 1
+        end
+        i += 1
+    end
+    i = 0
+    while i < array_len(bl) is
+        if bl[i] != "" && !array_contains(ll, bl[i]) is
+            write("  " + yellow_text("- CLOSED ") + bl[i] + "/tcp")
+            changes += 1
+        end
+        i += 1
+    end
+    if changes == 0 is
+        write("  " + green_text("no change against baseline"))
+    end
+    return changes
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    let host: string = positional(args, 2)
+    if cmd == "" || host == "" is
+        usage()
+        return
+    end
+    if cmd == "diff" is
+        banner("portwatch diff", "0.2.0", host)
+        let n: int = diff_ports(host)
+        if n > 0 is
+            exit(2)
+        end
+        return
+    end
+    if cmd != "scan" is
+        usage()
+        exit(1)
+    end
+    let ports: [int] = expand_ports(arg_val(args, "--ports", "top"))
+    let timeout: int = to_int(arg_val(args, "--timeout", "300"))
+    banner("portwatch scan", "0.2.0", host + "  (" + to_string(array_len(ports)) + " ports)")
+    let ip: string = sh("getent ahosts " + shquote(host) + " 2>/dev/null | awk '{print $1}' | head -1")
+    if ip == "" is
+        write(red_text("error:") + " cannot resolve " + host)
+        exit(1)
+    end
+    let mut open_list: string = ""
+    let mut found: int = 0
+    let mut risky_count: int = 0
+    let mut i: int = 0
+    while i < array_len(ports) is
+        let p: int = ports[i]
+        if scan_port(ip, p, timeout) is
+            found += 1
+            open_list = open_list + to_string(p) + "\n"
+            let svc: string = service_name(p)
+            if risky(p) is
+                risky_count += 1
+                write("  " + red_text(string_pad_right(to_string(p) + "/tcp", 10)) + svc + red_text("   ← exposed legacy/admin service"))
+            else is
+                write("  " + green_text(string_pad_right(to_string(p) + "/tcp", 10)) + svc)
+            end
+        end
+        i += 1
+    end
+    fs_write(last_file(host), open_list)
+    if arg_has(args, "--baseline") is
+        fs_write(base_file(host), open_list)
+        write(dim_text("  baseline saved"))
+    end
+    write(dim_text("  " + string_repeat("─", 58)))
+    write("  " + to_string(found) + " open, " + to_string(risky_count) + " risky")
+    if !arg_has(args, "--baseline") && fs_exists(base_file(host)) is
+        write("")
+        write(bold("  baseline diff"))
+        diff_ports(host)
+    end
+    if risky_count > 0 is
+        exit(2)
+    end
+end
