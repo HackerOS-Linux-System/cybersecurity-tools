@@ -1,0 +1,317 @@
+using <0.6>
+get <std:string> import <str_trim::str_split::str_contains::str_starts_with::str_replace::str_join::str_repeat::str_to_int::str_ends_with::str_to_float::str_index_of>
+get <std:io> import <read_file_or::write_file_ok::file_readable>
+get <std:fs> import <list_dir_or_empty::create_dir_ok>
+
+!! ── cybersec prelude (HackerScript) — shared helpers, 0.2 ───────────────────
+!! Authorised testing only: run these tools against systems you own or are
+!! explicitly permitted to assess.
+
+!! always succeeds at the run_command level (so a non-zero exit inside
+!! `cmd`, e.g. a `grep` with no match, never turns into a silent Err /
+!! empty string) — the real exit status is not needed by these tools,
+!! which only look at stdout text.
+fun sh(cmd: Str) -> Str [
+    match run_command("/bin/sh".to_string(), ["-c".to_string(), cmd + "; true"]) [
+        Ok(o) -> [ end str_trim(o) ]
+        Err(_e) -> [ end "" ]
+    ]
+]
+
+fun have_cmd(name: Str) -> Bool [
+    end command_ok(name)
+]
+
+fun command_ok(name: Str) -> Bool [
+    end sh("command -v " + sh_quote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+]
+
+fun sh_quote(s: Str) -> Str [
+    end "'" + str_replace(s, "'", "'\\''") + "'"
+]
+
+fun arg_has(args: List<Str>, flag: Str) -> Bool [
+    let i = 0
+    let n = args.len()
+    while i < n [
+        if args[i] == flag [
+            end true
+        ]
+        i = i + 1
+    ]
+    end false
+]
+
+fun arg_val(args: List<Str>, key: Str, dflt: Str) -> Str [
+    let pre: Str = key + "="
+    let i = 0
+    let n = args.len()
+    while i < n [
+        let a: Str = args[i].clone()
+        if str_starts_with(a.clone(), pre.clone()) [
+            end a.slice(pre.len(), a.len())
+        ]
+        if a == key and i + 1 < n [
+            end args[i + 1].clone()
+        ]
+        i = i + 1
+    ]
+    end dflt
+]
+
+fun positional(args: List<Str>, n: Int) -> Str [
+    let seen = 0
+    let i = 0
+    let total = args.len()
+    while i < total [
+        let a: Str = args[i].clone()
+        if not str_starts_with(a.clone(), "-") [
+            seen = seen + 1
+            if seen == n [
+                end a
+            ]
+        ]
+        i = i + 1
+    ]
+    end ""
+]
+
+fun c_cyan(s: Str) -> Str [ end "\e[36m" + s + "\e[0m" ]
+fun c_green(s: Str) -> Str [ end "\e[32m" + s + "\e[0m" ]
+fun c_yellow(s: Str) -> Str [ end "\e[33m" + s + "\e[0m" ]
+fun c_red(s: Str) -> Str [ end "\e[31m" + s + "\e[0m" ]
+fun c_dim(s: Str) -> Str [ end "\e[2m" + s + "\e[0m" ]
+fun c_bold(s: Str) -> Str [ end "\e[1m" + s + "\e[0m" ]
+
+fun banner(name: Str, ver: Str, desc: Str) [
+    log("")
+    log(c_cyan("  | " + name) + c_dim("  v" + ver + "  -  " + desc))
+    log(c_dim("  " + str_repeat("-", 58)))
+]
+
+fun ok_line(msg: Str) -> Int [
+    log("  " + c_green("PASS") + "  " + msg)
+    end 0
+]
+
+fun warn_line(msg: Str) -> Int [
+    log("  " + c_yellow("WARN") + "  " + msg)
+    end 1
+]
+
+fun bad_line(msg: Str) -> Int [
+    log("  " + c_red("FAIL") + "  " + msg)
+    end 2
+]
+
+fun info_line(msg: Str) [
+    log("  " + c_cyan("INFO") + "  " + msg)
+]
+
+fun pad_right(s: Str, width: Int) -> Str [
+    let out: Str = s.clone()
+    while out.len() < width [
+        out = out + " "
+    ]
+    end out
+]
+
+fun summary(tool: Str, checks: Int, warns: Int, fails: Int) -> Int [
+    log(c_dim("  " + str_repeat("-", 58)))
+    let line = tool + ": " + checks.to_string() + " checks, " + warns.to_string() + " warnings, " + fails.to_string() + " failures"
+    if fails > 0 [
+        log("  " + c_red(line))
+        end 2
+    ]
+    if warns > 0 [
+        log("  " + c_yellow(line))
+        end 1
+    ]
+    log("  " + c_green(line))
+    end 0
+]
+
+fun home_dir() -> Str [
+    match env_var("HOME") [
+        Some(v) -> [ end v ]
+        None -> [ end "/root" ]
+    ]
+]
+
+fun state_dir(tool: Str) -> Str [
+    let d = home_dir() + "/.hackeros/" + tool
+    sh("mkdir -p " + sh_quote(d))
+    end d
+]
+
+fun opt_int_or(o: Option<Int>, dflt: Int) -> Int [
+    match o [
+        Some(v) -> [ end v ]
+        None -> [ end dflt ]
+    ]
+]
+
+fun arg_int(args: List<Str>, key: Str, dflt: Int) -> Int [
+    end opt_int_or(str_to_int(arg_val(args, key, dflt.to_string())), dflt)
+]
+
+!! passforge — policy-driven password / passphrase generator & strength checker
+!! Usage: passforge gen [--length=20] [--count=1] [--no-symbols]
+!!        passforge phrase [--words=6]
+!!        passforge check <password>
+
+fun charset(no_symbols: Bool) -> Str [
+    let base = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    if no_symbols [
+        end base
+    ]
+    end base + "!@#$%^&*()-_=+[]{}"
+]
+
+fun gen_password(length: Int, no_symbols: Bool) -> Str [
+    let cs = charset(no_symbols)
+    let raw = sh("head -c " + (length * 4).to_string() + " /dev/urandom | od -An -tu1 | tr -s ' ' '\\n' | grep -v '^$'")
+    let nums = str_split(raw, "\n")
+    let out: Str = ""
+    let i = 0
+    let n = nums.len()
+    let m = cs.len()
+    while out.len() < length and i < n [
+        match str_to_int(nums[i].clone()) [
+            Some(v) -> [
+                let idx = v - ((v / m) * m)
+                out = out + cs.slice(idx, idx + 1)
+            ]
+            None -> [ ]
+        ]
+        i = i + 1
+    ]
+    end out
+]
+
+fun word_list() -> List<Str> [
+    end ["anchor", "basalt", "cipher", "delta", "ember", "falcon", "granite",
+         "harbor", "index", "jungle", "kernel", "lumen", "meadow", "nimbus",
+         "orbit", "pepper", "quartz", "ripple", "signal", "tundra", "umbra",
+         "velvet", "willow", "xenon", "yonder", "zephyr", "amber", "boulder",
+         "canyon", "driftwood", "echo", "forge", "glacier", "horizon", "ion",
+         "jasper", "knoll", "lagoon", "marble", "nova"]
+]
+
+fun gen_phrase(words: Int) -> Str [
+    let wl = word_list()
+    let n = wl.len()
+    let raw = sh("head -c " + (words * 4).to_string() + " /dev/urandom | od -An -tu2 | tr -s ' ' '\\n' | grep -v '^$'")
+    let nums = str_split(raw, "\n")
+    let out: Str = ""
+    let i = 0
+    let picked = 0
+    let cnt = nums.len()
+    while picked < words and i < cnt [
+        match str_to_int(nums[i].clone()) [
+            Some(v) -> [
+                let idx = v - ((v / n) * n)
+                if picked > 0 [
+                    out = out + "-"
+                ]
+                out = out + wl[idx].clone()
+                picked = picked + 1
+            ]
+            None -> [ ]
+        ]
+        i = i + 1
+    ]
+    let digit = sh("head -c 2 /dev/urandom | od -An -tu1 | tr -s ' ' '\\n' | grep -v '^$' | head -1")
+    end out + "-" + digit
+]
+
+fun has_lower(s: Str) -> Bool [ end str_contains(s, "a") or str_contains(s, "e") or str_contains(s, "i") or str_contains(s, "o") or str_contains(s, "n") or str_contains(s, "s") or str_contains(s, "t") or str_contains(s, "r") or str_contains(s, "l") or str_contains(s, "u") or str_contains(s, "c") or str_contains(s, "d") or str_contains(s, "m") or str_contains(s, "g") or str_contains(s, "b") or str_contains(s, "p") or str_contains(s, "f") or str_contains(s, "h") or str_contains(s, "v") or str_contains(s, "w") or str_contains(s, "y") or str_contains(s, "k") or str_contains(s, "j") or str_contains(s, "x") or str_contains(s, "q") or str_contains(s, "z") ]
+
+fun classes(s: Str) -> Int [
+    let lower = sh("printf %s " + sh_quote(s) + " | grep -c '[a-z]'")
+    let upper = sh("printf %s " + sh_quote(s) + " | grep -c '[A-Z]'")
+    let digit = sh("printf %s " + sh_quote(s) + " | grep -c '[0-9]'")
+    let sym = sh("printf %s " + sh_quote(s) + " | grep -c '[^a-zA-Z0-9]'")
+    let mut_count = 0
+    if lower != "0" [ mut_count = mut_count + 1 ]
+    if upper != "0" [ mut_count = mut_count + 1 ]
+    if digit != "0" [ mut_count = mut_count + 1 ]
+    if sym != "0" [ mut_count = mut_count + 1 ]
+    end mut_count
+]
+
+fun check_password(pw: Str) [
+    banner("passforge check", "0.2.0", "strength estimate")
+    let len = pw.len()
+    let cls = classes(pw)
+    info_line("length: " + len.to_string() + "   character classes: " + cls.to_string())
+    let common = ["password", "123456", "qwerty", "admin", "letmein", "welcome", "monkey", "dragon", "iloveyou", "football", "123456789", "12345678"]
+    let low = sh("printf %s " + sh_quote(pw) + " | tr 'A-Z' 'a-z'")
+    let i = 0
+    let n = common.len()
+    let hit: Str = ""
+    while i < n [
+        if low == common[i].clone() [
+            hit = common[i].clone()
+        ]
+        i = i + 1
+    ]
+    if hit != "" [
+        bad_line("matches a top-breached password list entry: '" + hit + "'")
+        exit(2)
+    ]
+    let bits = (len * cls * 2)
+    if len < 8 [
+        bad_line("too short (" + len.to_string() + " chars) — use 12+")
+        exit(2)
+    ]
+    if cls < 3 [
+        warn_line("only " + cls.to_string() + " character classes — mix upper/lower/digits/symbols")
+    ]
+    if len >= 16 and cls >= 3 [
+        ok_line("strong — long and varied")
+    ] elif len >= 12 and cls >= 2 [
+        ok_line("reasonable for most accounts; use a passphrase for high-value ones")
+    ] else [
+        warn_line("borderline — consider a longer passphrase")
+    ]
+    info_line("rough entropy estimate: ~" + bits.to_string() + " bits (heuristic, not exact)")
+]
+
+fun usage() [
+    banner("passforge", "0.2.0", "password & passphrase generator")
+    log("  passforge gen [--length=20] [--count=1] [--no-symbols]")
+    log("  passforge phrase [--words=6]")
+    log("  passforge check <password>")
+]
+
+fun main() [
+    let a = args()
+    let cmd = positional(a, 1)
+    if cmd == "" or arg_has(a, "--help") [
+        usage()
+        end
+    ]
+    if cmd == "gen" [
+        let len_v = arg_int(a, "--length", 20)
+        let cnt_v = arg_int(a, "--count", 1)
+        let no_sym = arg_has(a, "--no-symbols")
+        let i = 0
+        while i < cnt_v [
+            log(gen_password(len_v, no_sym))
+            i = i + 1
+        ]
+        end
+    ]
+    if cmd == "phrase" [
+        let w_v = arg_int(a, "--words", 6)
+        log(gen_phrase(w_v))
+        end
+    ]
+    if cmd == "check" [
+        check_password(positional(a, 2))
+        end
+    ]
+    usage()
+    exit(1)
+]
