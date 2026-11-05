@@ -1,0 +1,76 @@
+#!/usr/bin/hl
+/// pcapstat.hl — szybkie statystyki przechwyconego ruchu (protokoly, top talkers)
+/// Uzycie: edytuj @iface / @secs ponizej, potem: hl run pcapstat.hl
+/// Wymaga: tcpdump
+using <gen 2>
+
+// tcpdump
+
+% iface   = any
+% secs    = 10
+% out_cap = /tmp/hl_pcapstat.pcap
+
+::hr 58
+::bold  pcapstat — HackerOS packet capture statistics
+::hr 58
+::nl
+
+~> Interfejs: @iface
+~> Czas:      @secs s
+~> Plik:      @out_cap
+
+::which tcpdump
+? err
+    ::red tcpdump nie jest zainstalowany — przerywam.
+    > exit 1
+done
+
+: capture def
+    ~> Przechwytuje ruch przez @secs s (wymaga uprawnien do @iface)...
+    >> bash -c "timeout @secs tcpdump -i @iface -w @out_cap -U 2>/dev/null"
+
+    ? ok
+        ::green Przechwytywanie zakonczone.
+    done
+    ? err
+        ::yellow Przechwytywanie przerwane lub brak pakietow.
+    done
+done
+
+: proto_breakdown def
+    ~> Rozklad protokolow:
+    >> bash -c "tcpdump -nn -r @out_cap 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i==\"TCP\"||$i==\"UDP\"||$i==\"ICMP\"||$i==\"ARP\") {print $i; break}}' | sort | uniq -c | sort -rn" |> @_proto_table
+    ~> @_proto_table
+done
+
+: top_talkers def
+    ~> Top zrodlowe adresy IP:
+    >> bash -c "tcpdump -nn -r @out_cap 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -rn | head -10" |> @_talkers
+    ~> @_talkers
+done
+
+: packet_count def
+    >> bash -c "tcpdump -nn -r @out_cap 2>/dev/null | wc -l" |> @_count
+    ~>   Pakietow przechwyconych: @_count
+done
+
+-- capture
+
+::exists @out_cap
+? ok
+    -- packet_count
+    ::nl
+    -- proto_breakdown
+    ::nl
+    -- top_talkers
+done
+? err
+    ::red Brak pliku przechwytywania — nic do analizy.
+done
+
+> rm -f @out_cap
+
+::nl
+::hr 58
+::green pcapstat zakonczony.
+::hr 58
