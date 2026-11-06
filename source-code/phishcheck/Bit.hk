@@ -1,20 +1,19 @@
-[project]
--> name    => phishcheck
--> version => 0.2.0
--> edition => 2026
-
-[build]
--> entry   => src/main.h#
--> backend => cranelift
-
-[release]
--> backend  => hhc
--> optimize => O3
--> lto      => true
--> strip    => true
-
-[run]
--> entry => src/main.h#
+[package]
+-> name        => phishcheck
+-> version     => 0.2.0
+-> description => Heuristic phishing checker for URLs and e-mail headers
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => Apache-2.0
+-> lang        => h#
 
 [edition]
--> default => 2026
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[default-build]
+-> profile => release
