@@ -1,20 +1,19 @@
-[project]
--> name    => jam
--> version => 0.2.0
--> edition => 2026
-
-[build]
--> entry   => src/main.h#
--> backend => cranelift
-
-[release]
--> backend  => hhc
--> optimize => O3
--> lto      => true
--> strip    => true
-
-[run]
--> entry => src/main.h#
+[package]
+-> name        => rip
+-> version     => 0.2.0
+-> description => IPv4 / CIDR calculator and DNS helper
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => Apache-2.0
+-> lang        => h#
 
 [edition]
--> default => 2026
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[default-build]
+-> profile => release
