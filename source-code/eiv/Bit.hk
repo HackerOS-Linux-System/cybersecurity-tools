@@ -1,11 +1,19 @@
 [package]
--> name    => eiv
--> version => 0.1
+-> name        => eiv
+-> version     => 0.1.0
+-> description => SCADA / IoT / Web3 reconnaissance scanner
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => Apache-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
 
 [build]
--> lang   => h#
--> entry  => src/main.h#
--> output => build/eiv
+-> link => static
 
-[deps]
--> libc => dynamic
+[default-build]
+-> profile => release
