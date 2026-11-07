@@ -1,34 +1,38 @@
 mod net
 
+;; Maybe<T> is not a builtin in h# 0.9.0 - defined here (same as H-Sharp examples/showcase.h#)
+enum Maybe<T> is
+    Some(T)
+    None
+end
+
 ;; ═══════════════════════════════════════════════════════════════════════════════
 ;; MODBUS TCP
 ;; ═══════════════════════════════════════════════════════════════════════════════
 
 ;; Modbus TCP PDU: MBAP(6B) + FC(1B) + unit_id(1B) + addr(2B) + count(2B)
 fn modbus_make_pdu(unit_id: int) -> bytes is
-    unsafe arena(16) is
-        let mut pdu: bytes = b"\x00" * 12
-        ;; Transaction ID = 0x0001
-        pdu[0] = 0x00
-        pdu[1] = 0x01
-        ;; Protocol ID = 0x0000
-        pdu[2] = 0x00
-        pdu[3] = 0x00
-        ;; Length = 6
-        pdu[4] = 0x00
-        pdu[5] = 0x06
-        ;; Unit ID
-        pdu[6] = unit_id & 0xFF
-        ;; FC=03 Read Holding Registers
-        pdu[7] = 0x03
-        ;; Start address = 0x0000
-        pdu[8] = 0x00
-        pdu[9] = 0x00
-        ;; Quantity = 10
-        pdu[10] = 0x00
-        pdu[11] = 0x0A
-        return pdu
-    end
+    let mut pdu: bytes = net::zero_bytes(12)
+    ;; Transaction ID = 0x0001
+    pdu[0] = 0x00
+    pdu[1] = 0x01
+    ;; Protocol ID = 0x0000
+    pdu[2] = 0x00
+    pdu[3] = 0x00
+    ;; Length = 6
+    pdu[4] = 0x00
+    pdu[5] = 0x06
+    ;; Unit ID
+    pdu[6] = unit_id & 0xFF
+    ;; FC=03 Read Holding Registers
+    pdu[7] = 0x03
+    ;; Start address = 0x0000
+    pdu[8] = 0x00
+    pdu[9] = 0x00
+    ;; Quantity = 10
+    pdu[10] = 0x00
+    pdu[11] = 0x0A
+    return pdu
 end
 
 struct ModbusResult is
@@ -50,32 +54,31 @@ fn modbus_scan(ip: string) -> ModbusResult is
 
     let pdu: bytes = modbus_make_pdu(1)
 
-    unsafe arena(256) is
-        net::send(fd, pdu, 12, 0)
-        let buf: bytes = b"\x00" * 256
-        let n:   int   = net::recv(fd, buf, 255, 0)
-        net::close(fd)
+    let n: int = net::tcp_exchange(fd, pdu, 12, 2000)
+    net::close(fd)
 
-        if n >= 9 is
-            ;; Odpowiedź Modbus: buf[8] = byte_count
-            let coils: int = buf[8]
-            let risk: string = if coils > 100 then "CRITICAL"
-                               else if coils > 20 then "HIGH"
-                               else "MEDIUM" end end
-            return ModbusResult {
-                found:      true,
-                unit_id:    1,
-                coil_count: coils,
-                firmware:   "detected",
-                risk:       risk,
-            }
+    if n >= 9 is
+        ;; Odpowiedź Modbus: buf[8] = byte_count
+        let coils: int = net::resp_byte(8)
+        let mut risk: string = "MEDIUM"
+        if coils > 100 is
+            risk = "CRITICAL"
+        elsif coils > 20 is
+            risk = "HIGH"
         end
-
         return ModbusResult {
-            found: false, unit_id: 0,
-            coil_count: 0, firmware: "", risk: "NONE"
+            found:      true,
+            unit_id:    1,
+            coil_count: coils,
+            firmware:   "detected",
+            risk:       risk,
         }
     end
+
+    return ModbusResult {
+        found: false, unit_id: 0,
+        coil_count: 0, firmware: "", risk: "NONE"
+    }
 end
 
 ;; ═══════════════════════════════════════════════════════════════════════════════
@@ -83,19 +86,17 @@ end
 ;; ═══════════════════════════════════════════════════════════════════════════════
 
 fn bacnet_make_whois() -> bytes is
-    unsafe arena(8) is
-        ;; BVLC Original-Unicast + NPDU + APDU WHO-IS
-        let mut pkt: bytes = b"\x00" * 8
-        pkt[0] = 0x81   ;; BVLC Type
-        pkt[1] = 0x0B   ;; Original-Unicast-NPDU
-        pkt[2] = 0x00
-        pkt[3] = 0x08   ;; Length = 8
-        pkt[4] = 0x01   ;; NPDU version
-        pkt[5] = 0x04   ;; Control: expecting reply
-        pkt[6] = 0x10   ;; APDU: UnconfirmedRequest
-        pkt[7] = 0x08   ;; Service: Who-Is
-        return pkt
-    end
+    ;; BVLC Original-Unicast + NPDU + APDU WHO-IS
+    let mut pkt: bytes = net::zero_bytes(8)
+    pkt[0] = 0x81   ;; BVLC Type
+    pkt[1] = 0x0B   ;; Original-Unicast-NPDU
+    pkt[2] = 0x00
+    pkt[3] = 0x08   ;; Length = 8
+    pkt[4] = 0x01   ;; NPDU version
+    pkt[5] = 0x04   ;; Control: expecting reply
+    pkt[6] = 0x10   ;; APDU: UnconfirmedRequest
+    pkt[7] = 0x08   ;; Service: Who-Is
+    return pkt
 end
 
 fn bacnet_scan(ip: string) -> bool is
@@ -108,14 +109,12 @@ end
 ;; ═══════════════════════════════════════════════════════════════════════════════
 
 fn ethernetip_make_list_identity() -> bytes is
-    unsafe arena(24) is
-        let mut pkt: bytes = b"\x00" * 24
-        ;; EIP Encapsulation Header: ListIdentity (cmd=0x63)
-        pkt[0] = 0x63
-        pkt[1] = 0x00
-        ;; Pozostałe pola = 0 (session=0, status=0, context=0, options=0)
-        return pkt
-    end
+    let mut pkt: bytes = net::zero_bytes(24)
+    ;; EIP Encapsulation Header: ListIdentity (cmd=0x63)
+    pkt[0] = 0x63
+    pkt[1] = 0x00
+    ;; Pozostałe pola = 0 (session=0, status=0, context=0, options=0)
+    return pkt
 end
 
 fn ethernetip_scan(ip: string) -> bool is
@@ -123,14 +122,10 @@ fn ethernetip_scan(ip: string) -> bool is
     if fd < 0 is return false end
 
     let pkt: bytes = ethernetip_make_list_identity()
-    unsafe arena(512) is
-        net::send(fd, pkt, 24, 0)
-        let buf: bytes = b"\x00" * 512
-        let n:   int   = net::recv(fd, buf, 511, 0)
-        net::close(fd)
-        ;; Odpowiedź > 24B z cmd=0x63 = urządzenie EtherNet/IP
-        return n > 24 && buf[0] == 0x63
-    end
+    let n: int = net::tcp_exchange(fd, pkt, 24, 2000)
+    net::close(fd)
+    ;; Odpowiedź > 24B z cmd=0x63 = urządzenie EtherNet/IP
+    return n > 24 && net::resp_byte(0) == 0x63
 end
 
 ;; ═══════════════════════════════════════════════════════════════════════════════
@@ -138,11 +133,9 @@ end
 ;; ═══════════════════════════════════════════════════════════════════════════════
 
 fn profinet_scan(ip: string) -> bool is
-    unsafe arena(8) is
-        ;; DCP Identify Request (uproszczony — przez UDP port 34964)
-        let pkt: bytes = b"\xfe\xfe\x05\x00\x00\x01\x00\x00"
-        return net::udp_probe(ip, 34964, pkt, 8, 1000) > 0
-    end
+    ;; DCP Identify Request (uproszczony — przez UDP port 34964)
+    let pkt: bytes = [0xFE, 0xFE, 0x05, 0x00, 0x00, 0x01, 0x00, 0x00]
+    return net::udp_probe(ip, 34964, pkt, 8, 1000) > 0
 end
 
 ;; ═══════════════════════════════════════════════════════════════════════════════
@@ -169,30 +162,28 @@ end
 ;; ═══════════════════════════════════════════════════════════════════════════════
 
 fn mdns_make_query() -> bytes is
-    unsafe arena(48) is
-        ;; PTR query: _services._dns-sd._udp.local
-        let mut q: bytes = b"\x00" * 47
-        ;; Header: ID=0, Flags=0x0000, QDCOUNT=1
-        q[4] = 0x00
-        q[5] = 0x01
-        ;; QNAME: 9+'_services' 7+'_dns-sd' 4+'_udp' 5+'local' 0
-        q[12] = 9
-        q[13] = 0x5F  ;; '_'
-        q[14] = 0x73  ;; 's'
-        q[15] = 0x65  ;; 'e'
-        q[16] = 0x72  ;; 'r'
-        q[17] = 0x76  ;; 'v'
-        q[18] = 0x69  ;; 'i'
-        q[19] = 0x63  ;; 'c'
-        q[20] = 0x65  ;; 'e'
-        q[21] = 0x73  ;; 's'
-        ;; QTYPE=PTR(12), QCLASS=IN+unicast(0x8001)
-        q[43] = 0x00
-        q[44] = 0x0C
-        q[45] = 0x80
-        q[46] = 0x01
-        return q
-    end
+    ;; PTR query: _services._dns-sd._udp.local
+    let mut q: bytes = net::zero_bytes(47)
+    ;; Header: ID=0, Flags=0x0000, QDCOUNT=1
+    q[4] = 0x00
+    q[5] = 0x01
+    ;; QNAME: 9+'_services' 7+'_dns-sd' 4+'_udp' 5+'local' 0
+    q[12] = 9
+    q[13] = 0x5F  ;; '_'
+    q[14] = 0x73  ;; 's'
+    q[15] = 0x65  ;; 'e'
+    q[16] = 0x72  ;; 'r'
+    q[17] = 0x76  ;; 'v'
+    q[18] = 0x69  ;; 'i'
+    q[19] = 0x63  ;; 'c'
+    q[20] = 0x65  ;; 'e'
+    q[21] = 0x73  ;; 's'
+    ;; QTYPE=PTR(12), QCLASS=IN+unicast(0x8001)
+    q[43] = 0x00
+    q[44] = 0x0C
+    q[45] = 0x80
+    q[46] = 0x01
+    return q
 end
 
 fn mdns_probe(ip: string) -> bool is
