@@ -28,7 +28,7 @@
 -- Release of HackerOS-Linux-System/cybersecurity-tools to install.
 -- It is used verbatim as the tag in the URL, so write it exactly as the tag is
 -- named on GitHub (e.g. "0.2" or "v0.2").
-local VERSION = "0.2"
+local VERSION = "0.1"
 
 local REPO_URL    = "https://github.com/HackerOS-Linux-System/cybersecurity-tools"
 local PACK_NAME   = "pack.tar.gz"
