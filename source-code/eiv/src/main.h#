@@ -2,7 +2,7 @@ mod net
 mod proto
 
 ;; ── Tylko libc — jedyna zewnętrzna zależność ──────────────────────────────────
-extern dynamic [c] is
+extern static [c] is
     fn exit(code: int)
     fn getenv(name: string) -> string
 end
@@ -354,11 +354,9 @@ end
 fn read_hex_file(path: string) -> bytes is
     ;; io::read_bytes(path) gdy io module dostępny
     ;; Na razie zwracamy przykładowy bytecode EVM do demonstracji
-    unsafe arena(64) is
-        ;; Przykładowy bytecode z: PUSH1 0x00, CALL, SSTORE, SELFDESTRUCT
-        let demo: bytes = b"\x60\x00\xF1\x55\xFF\x01\x01\x57\x32\x14\x57"
-        return demo
-    end
+    ;; Przykładowy bytecode z: PUSH1 0x00, CALL, SSTORE, SELFDESTRUCT
+    let demo: bytes = [0x60, 0x00, 0xF1, 0x55, 0xFF, 0x01, 0x01, 0x57, 0x32, 0x14, 0x57]
+    return demo
 end
 
 fn run_web3(source: string) -> ScanReport is
@@ -531,7 +529,7 @@ fn main() is
             write("")
             usage()
             exit(1)
-            return ScanReport {
+            ScanReport {
                 module: "", target: "", findings: 0, risk: 0, json: "[]"
             }
         end
