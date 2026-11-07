@@ -1,246 +1,1024 @@
 using "2026"
-;; chker.h# — H# rewrite of the Odin kernel installer
-;; Commands: liquorix, xanmod, deb-kernel
+;; eiq — Everywhere Is Quiet
+;; Detektor "podejrzanej ciszy" i anty-forensyki na hoście Linux.
+;; Gdy atakujący sprząta po sobie, system robi się cichy: logi puste, skrócone albo
+;; przekierowane do /dev/null, auditd wyłączony, historia shella zablokowana, proces
+;; ukryty przed ps, moduł kernela niewidoczny w lsmod. eiq szuka właśnie ciszy.
+;; Authorized testing only: uruchamiaj na systemach, które posiadasz lub masz zgodę audytować.
 
-fn print_help() is
-    write("Usage: chker <command>")
-    write("Commands:")
-    write("  liquorix    - Install Liquorix kernel, remove Debian kernel")
-    write("  xanmod      - Install XanMod kernel, remove Debian kernel")
-    write("  deb-kernel  - Install Debian kernel, remove current custom kernel")
-end
+;; ── cybersec prelude — shared helpers (HackerOS cybersecurity-tools 0.2) ─────
 
-fn run_cmd(cmd: string) -> string is
+fn sh(cmd: string) -> string is
     return trim(shell(cmd))
 end
 
-fn sudo_run(cmd: string) is
-    shell("sudo " + cmd)
-end
-
-fn command_exists(cmd: string) -> bool is
-    let r: string = trim(shell("command -v " + cmd + " 2>/dev/null"))
-    return r != ""
-end
-
-fn get_cpu_model() -> string is
-    return trim(shell("grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs"))
-end
-
-fn get_cpu_vendor() -> string is
-    return trim(shell("grep 'vendor_id' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs"))
-end
-
-fn get_cpu_text() -> string is
-    let model: string  = to_lower(get_cpu_model())
-    let vendor: string = to_lower(get_cpu_vendor())
-    let lscpu: string  = to_lower(trim(shell("lscpu 2>/dev/null")))
-    return model + " " + vendor + " " + lscpu
-end
-
-fn get_current_kernel() -> string is
-    return trim(shell("uname -r"))
-end
-
-fn get_home() -> string is
-    return trim(shell("echo $HOME"))
-end
-
-fn parse_mappings(file: string) -> string is
-    ;; Returns newline-separated "pattern>target" lines
-    ;; Uses a Python helper to avoid shell quoting complexity
-    let script: string = "python3 -c \"import re,sys; txt=open(sys.argv[1]).read(); [print(m) for m in re.findall(r'[A-Za-z0-9_. -]+>[A-Za-z0-9_-]+', txt)]\" " + file + " 2>/dev/null"
-    return trim(shell(script))
-end
-
-fn match_cpu_variant(cpu_text: string, mappings: string) -> string is
-    ;; Write mappings to a temp file, then use a Python one-liner to match
-    let tmp: string = "/tmp/hsharp_mappings_tmp.txt"
-    fs_write(tmp, mappings)
-    let script: string = "python3 -c \""
-        + "import sys; lines=open('" + tmp + "').read().splitlines(); "
-        + "cpu='" + cpu_text + "'.lower(); "
-        + "pairs=[(l.split('>')[0].strip().lower(),l.split('>')[1].strip()) for l in lines if '>' in l]; "
-        + "pairs.sort(key=lambda x: -len(x[0])); "
-        + "result=[t for p,t in pairs if p in cpu]; "
-        + "print(result[0] if result else 'x86-64')"
-        + "\""
-    let matched: string = trim(shell(script))
-    if matched == "" is
-        return "x86-64"
+fn arg_has(args: [string], flag: string) -> bool is
+    let mut i: int = 1
+    while i < array_len(args) is
+        if args[i] == flag is
+            return true
+        end
+        i += 1
     end
-    return matched
+    return false
 end
 
-fn get_xanmod_variant(target: string) -> string is
-    let v: string = "x64v1"
-    if contains(target, "v3") is
-        v = "x64v3"
-    elsif contains(target, "v2") is
-        v = "x64v2"
+;; --key=value  or  --key value
+fn arg_val(args: [string], key: string, dflt: string) -> string is
+    let pre: string = key + "="
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if starts_with(a, pre) is
+            return string_slice(a, string_len(pre), string_len(a))
+        end
+        if a == key && i + 1 < array_len(args) is
+            return args[i + 1]
+        end
+        i += 1
     end
-    return v
+    return dflt
 end
 
-fn check_and_install_nvidia(prefix: string) is
-    write(prefix + " Sprawdzam NVIDIA...")
-    if command_exists("lspci") == false is
-        sudo_run("apt install -y pciutils")
+fn positional(args: [string], n: int) -> string is
+    let mut seen: int = 0
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if !starts_with(a, "-") is
+            seen += 1
+            if seen == n is
+                return a
+            end
+        end
+        i += 1
     end
-    let lspci: string = to_lower(trim(shell("lspci -nnk 2>/dev/null")))
-    if contains(lspci, "nvidia") is
-        write(prefix + " Wykryto NVIDIA - instaluje sterowniki.")
-        sudo_run("apt update")
-        sudo_run("apt install -y nvidia-driver nvidia-kernel-dkms nvidia-smi libnvidia-ml1 nvidia-settings")
+    return ""
+end
+
+fn banner(name: string, ver: string, desc: string) is
+    write("")
+    write(cyan_text("  ▌ " + name) + dim_text("  v" + ver + "  ·  " + desc))
+    write(dim_text("  " + string_repeat("─", 58)))
+end
+
+fn home_dir() -> string is
+    return env_home()
+end
+
+;; ── model: finding = "sev|module|title|detail|hint" ───────────────────────────
+;; sev: 4 CRIT, 3 HIGH, 2 MED, 1 LOW, 0 INFO
+
+fn lines_of(out: string) -> [string] is
+    let mut empty: [string] = []
+    if out == "" is
+        return empty
+    end
+    let rows: [string] = split(out, "\n")
+    return rows
+end
+
+fn clean(s: string) -> string is
+    let a: string = replace(s, "|", "/")
+    return replace(a, "\n", "; ")
+end
+
+fn mk(sev: int, module: string, title: string, detail: string, hint: string) -> string is
+    let sep: string = "|"
+    let mut out: string = to_string(sev) + sep + module + sep
+    out = out + clean(title) + sep + clean(detail) + sep + clean(hint)
+    return out
+end
+
+fn field(f: string, n: int) -> string is
+    let parts: [string] = split(f, "|")
+    if n < array_len(parts) is
+        return parts[n]
+    end
+    return ""
+end
+
+fn sev_of(f: string) -> int is
+    return to_int(field(f, 0))
+end
+
+fn sev_name(s: int) -> string is
+    if s >= 4 is
+        return "CRIT"
+    end
+    if s == 3 is
+        return "HIGH"
+    end
+    if s == 2 is
+        return "MED"
+    end
+    if s == 1 is
+        return "LOW"
+    end
+    return "INFO"
+end
+
+fn sev_tag(s: int) -> string is
+    let n: string = string_pad_right(sev_name(s), 4)
+    if s >= 4 is
+        return bold(red_text(n))
+    end
+    if s == 3 is
+        return red_text(n)
+    end
+    if s == 2 is
+        return yellow_text(n)
+    end
+    if s == 1 is
+        return cyan_text(n)
+    end
+    return dim_text(n)
+end
+
+fn sev_from_name(name: string) -> int is
+    let n: string = to_lower(name)
+    if n == "crit" || n == "critical" is
+        return 4
+    end
+    if n == "high" is
+        return 3
+    end
+    if n == "med" || n == "medium" is
+        return 2
+    end
+    if n == "low" is
+        return 1
+    end
+    if n == "info" is
+        return 0
+    end
+    return -1
+end
+
+fn sev_weight(s: int) -> int is
+    if s >= 4 is
+        return 35
+    end
+    if s == 3 is
+        return 20
+    end
+    if s == 2 is
+        return 8
+    end
+    if s == 1 is
+        return 2
+    end
+    return 0
+end
+
+fn jesc(s: string) -> string is
+    let a: string = replace(s, "\\", "\\\\")
+    let b: string = replace(a, "\"", "\\\"")
+    return replace(b, "\t", " ")
+end
+
+fn shorten(s: string, n: int) -> string is
+    if string_len(s) <= n is
+        return s
+    end
+    return string_slice(s, 0, n) + "…"
+end
+
+;; ── low-level probes ──────────────────────────────────────────────────────────
+
+fn now_epoch() -> int is
+    return to_int(sh("date +%s"))
+end
+
+;; EIQ_UPTIME=<sekundy> nadpisuje uptime (do testów na świeżych maszynach/kontenerach)
+fn uptime_s() -> int is
+    let ov: string = env_get("EIQ_UPTIME")
+    if ov != "" is
+        return to_int(ov)
+    end
+    return to_int(sh("cut -d. -f1 /proc/uptime 2>/dev/null"))
+end
+
+fn yes(cmd: string) -> bool is
+    return sh(cmd + " && echo y") == "y"
+end
+
+fn file_size(p: string) -> int is
+    return to_int(sh("stat -c %s " + shquote(p) + " 2>/dev/null"))
+end
+
+fn file_mtime(p: string) -> int is
+    return to_int(sh("stat -c %Y " + shquote(p) + " 2>/dev/null"))
+end
+
+fn file_ctime(p: string) -> int is
+    return to_int(sh("stat -c %Z " + shquote(p) + " 2>/dev/null"))
+end
+
+fn file_inode(p: string) -> string is
+    return sh("stat -c %i " + shquote(p) + " 2>/dev/null")
+end
+
+fn is_root() -> bool is
+    return sh("id -u") == "0"
+end
+
+fn in_container() -> bool is
+    return yes("[ -f /.dockerenv ] || grep -qE '(docker|kubepods|containerd|lxc)' /proc/1/cgroup 2>/dev/null")
+end
+
+fn days_str(secs: int) -> string is
+    if secs >= 172800 is
+        return to_string(secs / 86400) + " dni"
+    end
+    return to_string(secs / 3600) + " h"
+end
+
+;; ── module: logs ──────────────────────────────────────────────────────────────
+;; Logi, które powinny rosnąć, a są puste, stare, przekierowane, zamrożone lub zniknęły.
+
+fn gap_awk() -> string is
+    let mut a: string = "function ep(y,m,d,h,mi,s,  yy,mm,era,yoe,doy,doe){yy=y-(m<=2);era=int(yy/400);yoe=yy-era*400;mm=m+(m>2?-3:9);doy=int((153*mm+2)/5)+d-1;doe=yoe*365+int(yoe/4)-int(yoe/100)+doy;return (era*146097+doe-719468)*86400+h*3600+mi*60+s} "
+    a = a + "function ts(l,  m){ if (l ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return ep(substr(l,1,4)+0,substr(l,6,2)+0,substr(l,9,2)+0,substr(l,12,2)+0,substr(l,15,2)+0,substr(l,18,2)+0); "
+    a = a + "if (l ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/){ m=(index(\"JanFebMarAprMayJunJulAugSepOctNovDec\",substr(l,1,3))+2)/3; return ep(yr+0,m,substr(l,5,2)+0,substr(l,8,2)+0,substr(l,11,2)+0,substr(l,14,2)+0)} return 0} "
+    a = a + "BEGIN{split(bt,p,\" \"); boot=ep(p[1]+0,p[2]+0,p[3]+0,p[4]+0,p[5]+0,p[6]+0); yr=p[1]} "
+    a = a + "{t=ts($0); if(t>0){ if(prev>0 && t-prev>gap && prev>boot && t-prev>best){best=t-prev;la=pl;lb=$0} prev=t; pl=$0}} "
+    a = a + "END{if(best>0) printf \"%d|%s|%s\\n\", best, substr(la,1,19), substr(lb,1,19)}"
+    return a
+end
+
+fn first_existing(base: string, names: [string]) -> string is
+    let mut i: int = 0
+    while i < array_len(names) is
+        let p: string = base + "/" + names[i]
+        if fs_exists(p) is
+            return p
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn mod_logs(logdir: string, gap_h: int) -> [string] is
+    let mut r: [string] = []
+    let up: int = uptime_s()
+    let now: int = now_epoch()
+    let core: [string] = ["auth.log", "secure", "syslog", "messages", "kern.log", "audit/audit.log", "wtmp", "btmp", "lastlog"]
+    let mut i: int = 0
+    while i < array_len(core) is
+        let name: string = core[i]
+        let p: string = logdir + "/" + name
+        let q: string = shquote(p)
+        if fs_exists(p) is
+            if yes("[ -L " + q + " ] && [ \"$(readlink -f " + q + ")\" = /dev/null ]") is
+                r = array_push(r, mk(4, "logs", name + " przekierowany do /dev/null", p, "Przywróć zwykły plik i ustal, kto i kiedy podmienił dowiązanie (ls -l, stat)."))
+            else is
+                let size: int = file_size(p)
+                let mtime: int = file_mtime(p)
+                let ctime: int = file_ctime(p)
+                let must: bool = name == "syslog" || name == "messages" || name == "wtmp" || name == "auth.log" || name == "secure"
+                if size == 0 && up > 21600 && name != "btmp" && name != "lastlog" is
+                    let mut sv: int = 2
+                    if must is
+                        sv = 3
+                    end
+                    r = array_push(r, mk(sv, "logs", name + " jest pusty mimo pracy systemu " + days_str(up), p, "Log wyczyszczony (truncate/shred) albo usługa logująca nie pisze. Sprawdź lsattr, lsof, journalctl."))
+                end
+                if (name == "syslog" || name == "messages") && size > 0 && up > 172800 && mtime > 0 && now - mtime > 172800 is
+                    r = array_push(r, mk(2, "logs", name + " nie dostał wpisu od " + days_str(now - mtime), p, "Syslog powinien pisać stale (cron, systemd). Cisza = rsyslog zatrzymany albo log zamrożony."))
+                end
+                if (name == "auth.log" || name == "secure") && size > 0 && up > 604800 && mtime > 0 && now - mtime > 604800 is
+                    r = array_push(r, mk(1, "logs", name + " bez wpisów od " + days_str(now - mtime), p, "Na serwerze z sshd/sudo to nietypowe. Zweryfikuj, czy logowanie auth działa."))
+                end
+                if mtime > now + 300 is
+                    r = array_push(r, mk(2, "logs", name + " ma datę modyfikacji z przyszłości", p, "Możliwa manipulacja znacznikami czasu (timestomp)."))
+                end
+                if (name == "syslog" || name == "messages") && ctime > 0 && mtime > 0 && ctime - mtime > 86400 is
+                    r = array_push(r, mk(1, "logs", name + ": ctime nowsze od mtime o " + days_str(ctime - mtime), p, "Plik zmieniany bez zapisu (chmod/chown/touch -d). Porównaj z baseline."))
+                end
+                if yes("lsattr -d " + q + " 2>/dev/null | awk '{print $1}' | grep -q i") is
+                    r = array_push(r, mk(3, "logs", name + " ma flagę immutable (chattr +i)", p, "Log zamrożony - nic nie zostanie dopisane. lsattr " + p + "; chattr -i."))
+                end
+                if yes("case $(stat -c %a " + q + ") in *[2367]) true;; *) false;; esac") is
+                    r = array_push(r, mk(2, "logs", name + " zapisywalny dla wszystkich (other+w)", p, "Każdy użytkownik może zmienić log. chmod o-w " + p))
+                end
+            end
+        end
+        i += 1
+    end
+
+    ;; brak logu, gdy demon logujący jest skonfigurowany
+    let has_rsyslog: bool = fs_exists("/etc/rsyslog.conf") || fs_exists("/etc/syslog-ng/syslog-ng.conf")
+    if has_rsyslog && !in_container() is
+        let auth: string = first_existing(logdir, ["auth.log", "secure"])
+        if auth == "" is
+            r = array_push(r, mk(3, "logs", "Brak logu uwierzytelniania (auth.log/secure)", logdir, "rsyslog/syslog-ng jest zainstalowany, a pliku nie ma - log usunięty lub logowanie wyłączone."))
+        end
+        let sysl: string = first_existing(logdir, ["syslog", "messages"])
+        if sysl == "" is
+            r = array_push(r, mk(3, "logs", "Brak głównego logu systemowego (syslog/messages)", logdir, "rsyslog/syslog-ng jest zainstalowany, a pliku nie ma."))
+        end
+    end
+    if !in_container() && !fs_exists(logdir + "/wtmp") && fs_exists("/run/utmp") is
+        r = array_push(r, mk(2, "logs", "Brak wtmp (historia logowań)", logdir + "/wtmp", "last/lastb nie pokażą nic. Plik usunięty?"))
+    end
+
+    ;; journald
+    if have_systemd() is
+        if is_root() && up > 600 is
+            let n: int = to_int(sh("journalctl -q --no-pager -n 5 2>/dev/null | wc -l"))
+            if n == 0 is
+                r = array_push(r, mk(3, "logs", "Dziennik journald jest pusty", "journalctl -n 5 nic nie zwraca", "Dziennik wyczyszczony (--vacuum/--rotate) albo journald nie zapisuje."))
+            end
+        end
+        if !fs_exists("/var/log/journal") && !yes("grep -rqiE '^[[:space:]]*Storage[[:space:]]*=[[:space:]]*none' /etc/systemd/journald.conf /etc/systemd/journald.conf.d 2>/dev/null") is
+            r = array_push(r, mk(1, "logs", "journald działa tylko w RAM (brak /var/log/journal)", "logi znikają po restarcie", "mkdir -p /var/log/journal; systemctl restart systemd-journald."))
+        end
+    end
+
+    ;; luka czasowa w syslog/messages
+    let gap_file: string = first_existing(logdir, ["syslog", "messages"])
+    if gap_file != "" && up > gap_h * 3600 + 600 is
+        let secs: int = gap_h * 3600
+        let boot_date: string = "$(date -d @$(( $(date +%s) - " + to_string(up) + " )) +'%Y %m %d %H %M %S')"
+        let cmd: string = "tail -n 50000 " + shquote(gap_file) + " 2>/dev/null | awk -v bt=\"" + boot_date + "\" -v gap=" + to_string(secs) + " '" + gap_awk() + "'"
+        let out: string = sh(cmd)
+        if out != "" is
+            let g: [string] = split(out, "|")
+            if array_len(g) >= 3 is
+                let gs: int = to_int(g[0])
+                r = array_push(r, mk(2, "logs", "Luka w " + gap_file + ": " + days_str(gs) + " ciszy w trakcie pracy systemu", g[1] + "  ->  " + g[2], "Fragment logu mógł zostać wycięty albo logowanie było wyłączone w tym oknie. Porównaj z wtmp i journalctl."))
+            end
+        end
+    end
+    return r
+end
+
+fn have_systemd() -> bool is
+    return fs_exists("/run/systemd/system") && have_cmd_q("journalctl")
+end
+
+fn have_cmd_q(name: string) -> bool is
+    return sh("command -v " + shquote(name) + " >/dev/null 2>&1 && echo y || echo n") == "y"
+end
+
+;; ── module: audit ─────────────────────────────────────────────────────────────
+;; Czy system w ogóle może coś zgłosić: auditd, rsyslog, sshd LogLevel, sprzątające crony.
+
+fn svc_state(name: string) -> string is
+    return sh("systemctl is-active " + name + " 2>/dev/null")
+end
+
+fn svc_installed(name: string) -> bool is
+    return yes("systemctl cat " + name + ".service >/dev/null 2>&1")
+end
+
+fn proc_running(name: string) -> bool is
+    return yes("pidof " + name + " >/dev/null 2>&1")
+end
+
+fn mod_audit(root: bool) -> [string] is
+    let mut r: [string] = []
+
+    ;; demon logujący
+    let mut logger: bool = false
+    let loggers: [string] = ["rsyslog", "syslog-ng", "systemd-journald", "syslogd", "metalog"]
+    let mut i: int = 0
+    while i < array_len(loggers) is
+        if svc_state(loggers[i]) == "active" || proc_running(loggers[i]) is
+            logger = true
+        end
+        i += 1
+    end
+    if !logger && !in_container() is
+        r = array_push(r, mk(3, "audit", "Brak działającego demona logującego", "rsyslog / syslog-ng / journald - żaden nie działa", "System nic nie zapisuje. systemctl start rsyslog (lub journald)."))
+    end
+
+    ;; auditd
+    let have_audit: bool = have_cmd_q("auditctl") || svc_installed("auditd")
+    if have_audit is
+        let st: string = svc_state("auditd")
+        if st != "active" && !proc_running("auditd") is
+            r = array_push(r, mk(2, "audit", "auditd zainstalowany, ale nie działa", "stan: " + st, "systemctl enable --now auditd"))
+        elsif root is
+            let s: string = sh("auditctl -s 2>/dev/null")
+            if string_contains(s, "enabled 0") is
+                r = array_push(r, mk(3, "audit", "Audit jądra wyłączony (auditctl -e 0)", "enabled 0", "auditctl -e 1 (lub -e 2 = niezmienny do restartu)."))
+            end
+            let rules: string = sh("auditctl -l 2>/dev/null")
+            if string_contains(rules, "No rules") is
+                r = array_push(r, mk(2, "audit", "auditd działa bez żadnych reguł", "auditctl -l: No rules", "Dodaj reguły (np. /etc/audit/rules.d/) - bez nich audit jest ślepy."))
+            end
+        end
     else is
-        write(prefix + " Nie wykryto NVIDIA.")
+        r = array_push(r, mk(1, "audit", "auditd niezainstalowany", "brak śladu audytu zdarzeń jądra", "apt install auditd / dnf install audit"))
+    end
+
+    ;; journald wyłączony w konfiguracji
+    if yes("grep -rhiE '^[[:space:]]*Storage[[:space:]]*=[[:space:]]*none' /etc/systemd/journald.conf /etc/systemd/journald.conf.d 2>/dev/null | grep -q .") is
+        r = array_push(r, mk(3, "audit", "journald: Storage=none", "/etc/systemd/journald.conf*", "Dziennik systemowy nie jest nigdzie zapisywany."))
+    end
+
+    ;; rsyslog zrzuca auth do /dev/null
+    let nulls: string = sh("grep -rhE '^[^#]*(auth|authpriv|\\*)[^#]*[[:space:]]-?/dev/null' /etc/rsyslog.conf /etc/rsyslog.d 2>/dev/null | head -3")
+    if nulls != "" is
+        r = array_push(r, mk(3, "audit", "rsyslog wysyła logi do /dev/null", nulls, "Usuń regułę - komunikaty auth/authpriv są kasowane."))
+    end
+
+    ;; sshd LogLevel
+    let mut ll: string = to_lower(sh("sshd -T 2>/dev/null | awk '/^loglevel/{print $2}'"))
+    if ll == "" is
+        ll = to_lower(sh("grep -rhiE '^[[:space:]]*LogLevel' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | tail -1 | awk '{print $2}'"))
+    end
+    if ll == "quiet" is
+        r = array_push(r, mk(3, "audit", "sshd: LogLevel QUIET", "sshd nie loguje prób logowania", "Ustaw LogLevel INFO (lub VERBOSE) w sshd_config."))
+    elsif ll == "fatal" is
+        r = array_push(r, mk(2, "audit", "sshd: LogLevel FATAL", "pomijane nieudane logowania", "Ustaw LogLevel INFO lub VERBOSE."))
+    end
+
+    ;; zaplanowane sprzątanie logów / historii
+    let pat: string = "(truncate[[:space:]]+-s|shred[[:space:]]|rm[[:space:]]+(-[a-z]+[[:space:]]+)*/var/log|>[[:space:]]*/var/log/|journalctl[[:space:]]+--vacuum|history[[:space:]]+-c|unset[[:space:]]+HISTFILE|utmpdump|logtamper|logcleaner)"
+    let wipe: string = sh("grep -rEnH '" + pat + "' /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /var/spool/cron /etc/systemd/system 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*#' | head -5")
+    if wipe != "" is
+        r = array_push(r, mk(3, "audit", "Zaplanowane zadanie kasuje/skraca logi", wipe, "Sprawdź, kto dodał wpis (stat, crontab -l -u <user>). Typowa anty-forensyka."))
+    end
+
+    ;; logrotate niszczący logi natychmiast
+    let lr: string = sh("grep -rEnH '^[[:space:]]*rotate[[:space:]]+0|^[[:space:]]*shred' /etc/logrotate.conf /etc/logrotate.d 2>/dev/null | head -3")
+    if lr != "" is
+        r = array_push(r, mk(2, "audit", "logrotate usuwa logi bez archiwum (rotate 0)", lr, "Ustaw rotate >= 4 i kompresję zamiast kasowania."))
+    end
+    return r
+end
+
+;; ── module: history ───────────────────────────────────────────────────────────
+;; Historia powłoki zablokowana, wyczyszczona albo wyłączona w profilach.
+
+fn homes_cmd() -> string is
+    return "getent passwd 2>/dev/null | awk -F: '($3==0||$3>=1000)&&$7!~/(nologin|false)$/{print $6}' | sort -u"
+end
+
+fn mod_history() -> [string] is
+    let mut r: [string] = []
+    let hf: string = ".bash_history .zsh_history .python_history .mysql_history .psql_history .sqlite_history .node_repl_history"
+
+    let nulled: string = sh("for h in $(" + homes_cmd() + "); do for f in " + hf + "; do [ -L \"$h/$f\" ] && [ \"$(readlink -f \"$h/$f\")\" = /dev/null ] && echo \"$h/$f\"; done; done")
+    let nl: [string] = lines_of(nulled)
+    let mut i: int = 0
+    while i < array_len(nl) is
+        r = array_push(r, mk(3, "history", "Historia przekierowana do /dev/null", nl[i], "Klasyczne zacieranie śladów. rm plik; sprawdź ~/.bashrc oraz kto zalogował się jako ten użytkownik."))
+        i += 1
+    end
+
+    let frozen: string = sh("for h in $(" + homes_cmd() + "); do for f in " + hf + "; do [ -e \"$h/$f\" ] && lsattr -d \"$h/$f\" 2>/dev/null | awk '{print $1}' | grep -q i && echo \"$h/$f\"; done; done")
+    let fl: [string] = lines_of(frozen)
+    i = 0
+    while i < array_len(fl) is
+        r = array_push(r, mk(2, "history", "Plik historii zamrożony (chattr +i)", fl[i], "Nic nie zostanie dopisane. chattr -i i zbadaj dlaczego."))
+        i += 1
+    end
+
+    let empty: string = sh("for h in $(" + homes_cmd() + "); do for f in .bash_history .zsh_history; do [ -f \"$h/$f\" ] && [ ! -L \"$h/$f\" ] && [ ! -s \"$h/$f\" ] && [ -f \"$h/.bashrc\" ] && echo \"$h/$f\"; done; done")
+    let el: [string] = lines_of(empty)
+    i = 0
+    while i < array_len(el) is
+        r = array_push(r, mk(1, "history", "Pusty plik historii u aktywnego użytkownika", el[i], "Wyczyszczony (history -c; > plik) albo konto nieużywane."))
+        i += 1
+    end
+
+    let pat: string = "HISTFILE=/dev/null|HISTFILE=$|unset[[:space:]]+HISTFILE|HISTSIZE=0|HISTFILESIZE=0|set [+]o history|history[[:space:]]+-c|rm[[:space:]].*_history|>[[:space:]]*[^ ]*_history"
+    let sys: string = "/etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/bashrc /etc/zsh/zshrc /etc/zsh/zprofile /etc/zshrc"
+    let usr: string = ".bashrc .bash_profile .profile .bash_login .bash_logout .zshrc .zprofile .zlogout"
+    let cmd: string = "{ grep -nHE '" + pat + "' " + sys + " 2>/dev/null; for h in $(" + homes_cmd() + "); do for f in " + usr + "; do [ -f \"$h/$f\" ] && grep -nHE '" + pat + "' \"$h/$f\" 2>/dev/null; done; done; } | grep -vE ':[0-9]+:[[:space:]]*#' | head -8"
+    let cfg: string = sh(cmd)
+    let cl: [string] = lines_of(cfg)
+    i = 0
+    while i < array_len(cl) is
+        r = array_push(r, mk(3, "history", "Wyłączanie historii w pliku konfiguracyjnym", cl[i], "Zapis historii jest kasowany lub wyłączany przy logowaniu/wylogowaniu."))
+        i += 1
+    end
+    return r
+end
+
+;; ── module: services ──────────────────────────────────────────────────────────
+;; Narzędzia bezpieczeństwa, które są zainstalowane, ale zamilkły.
+
+fn mod_services() -> [string] is
+    let mut r: [string] = []
+    if !have_systemd() is
+        return r
+    end
+    let watch: [string] = ["auditd", "falco", "osqueryd", "wazuh-agent", "ossec", "crowdsec", "fail2ban", "clamav-daemon", "aide", "tripwire", "rkhunter", "sysmon"]
+    let mut i: int = 0
+    while i < array_len(watch) is
+        let n: string = watch[i]
+        if svc_installed(n) is
+            let st: string = svc_state(n)
+            if st != "active" is
+                let mut sv: int = 2
+                if n == "clamav-daemon" || n == "aide" || n == "tripwire" || n == "rkhunter" is
+                    sv = 1
+                end
+                r = array_push(r, mk(sv, "services", n + " zainstalowany, ale nieaktywny", "stan: " + st, "systemctl status " + n + "; journalctl -u " + n + " - kiedy i dlaczego się zatrzymał?"))
+            end
+        end
+        i += 1
+    end
+    if have_cmd_q("getenforce") is
+        let se: string = sh("getenforce 2>/dev/null")
+        if se == "Disabled" || se == "Permissive" is
+            r = array_push(r, mk(1, "services", "SELinux: " + se, "getenforce", "Przywróć tryb Enforcing, jeśli nie ma powodu, by go osłabiać."))
+        end
+    end
+    return r
+end
+
+;; ── module: procs ────────────────────────────────────────────────────────────
+;; Ukryte procesy, binarki usunięte z dysku, moduły jądra niewidoczne w lsmod.
+
+fn mod_procs(deep: bool) -> [string] is
+    let mut r: [string] = []
+
+    ;; PID-y dostępne w /proc/<pid>, ale nieobecne na liście readdir
+    let mut lim: int = 65536
+    if deep is
+        lim = 4194304
+    end
+    let scan: string = "lim=" + to_string(lim) + "; max=$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 32768); [ \"$lim\" -gt \"$max\" ] && lim=$max; l1=\" $(ls /proc | grep -E '^[0-9]+$' | tr '\\n' ' ') \"; c=\"\"; p=1; while [ $p -le $lim ]; do if [ -d /proc/$p ]; then case \"$l1\" in *\" $p \"*) ;; *) c=\"$c $p\";; esac; fi; p=$((p+1)); done; sleep 1; l2=\" $(ls /proc | grep -E '^[0-9]+$' | tr '\\n' ' ') \"; for p in $c; do case \"$l2\" in *\" $p \"*) continue;; esac; [ -d /proc/$p ] || continue; tg=$(awk '/^Tgid:/{print $2}' /proc/$p/status 2>/dev/null); [ \"$tg\" = \"$p\" ] || continue; echo \"$p:$(cat /proc/$p/comm 2>/dev/null)\"; done"
+    let hid: string = sh(scan)
+    let hl: [string] = lines_of(hid)
+    let mut i: int = 0
+    while i < array_len(hl) is
+        r = array_push(r, mk(4, "procs", "Ukryty proces (jest w /proc/PID, brak w ps/readdir)", hl[i], "Wzorzec rootkita user-land/LKM. Zbadaj /proc/PID/exe, cmdline, maps; rozważ analizę offline."))
+        i += 1
+    end
+
+    ;; binarki: memfd, katalogi tymczasowe, usunięte z dysku
+    let ex: string = sh("for e in /proc/[0-9]*/exe; do t=$(readlink \"$e\" 2>/dev/null) || continue; pid=$(echo $e | cut -d/ -f3); [ \"$pid\" = \"$$\" ] && continue; c=$(cat /proc/$pid/comm 2>/dev/null); case \"$t\" in *runc*) ;; /memfd:*) echo \"memfd|$pid|$c|$t\";; /tmp/*|/dev/shm/*|/var/tmp/*|/run/shm/*) echo \"tmp|$pid|$c|$t\";; *\"(deleted)\"*) echo \"del|$pid|$c|$t\";; esac; done | head -20")
+    let xl: [string] = lines_of(ex)
+    i = 0
+    while i < array_len(xl) is
+        let p: [string] = split(xl[i], "|")
+        if array_len(p) >= 4 is
+            let desc: string = "PID " + p[1] + " (" + p[2] + ") -> " + p[3]
+            if p[0] == "memfd" is
+                r = array_push(r, mk(4, "procs", "Proces uruchomiony z pamięci (memfd) - fileless", desc, "Binarka nie istnieje na dysku. Typowe dla malware bezplikowego; zrzuć /proc/PID/exe."))
+            elsif p[0] == "tmp" is
+                r = array_push(r, mk(3, "procs", "Proces działa z katalogu tymczasowego", desc, "Legalne usługi nie startują z /tmp, /dev/shm ani /var/tmp."))
+            else is
+                r = array_push(r, mk(2, "procs", "Proces z usuniętą binarką", desc, "Po aktualizacji pakietu to normalne (restart usługi). W innym razie - ślad zacierania."))
+            end
+        end
+        i += 1
+    end
+
+    ;; ld.so.preload
+    if yes("[ -s /etc/ld.so.preload ]") is
+        let c: string = sh("head -3 /etc/ld.so.preload")
+        r = array_push(r, mk(3, "procs", "/etc/ld.so.preload jest niepusty", c, "Biblioteka wstrzykiwana do każdego procesu - standardowa metoda ukrywania w user-land."))
+    end
+
+    ;; ukryte moduły jądra (w /sys/module, brak w /proc/modules i odwrotnie)
+    let hm: string = sh("for d in /sys/module/*/initstate; do [ -e \"$d\" ] || continue; m=$(basename $(dirname $d)); grep -q \"^$m \" /proc/modules || echo \"$m\"; done | head -10")
+    let ml: [string] = lines_of(hm)
+    i = 0
+    while i < array_len(ml) is
+        r = array_push(r, mk(4, "procs", "Moduł jądra ukryty przed lsmod", ml[i], "Jest w /sys/module, nie ma w /proc/modules - wzorzec LKM rootkita."))
+        i += 1
+    end
+    let gm: string = sh("awk '{print $1}' /proc/modules 2>/dev/null | while read m; do [ -d \"/sys/module/$m\" ] || echo \"$m\"; done | head -10")
+    let gl: [string] = lines_of(gm)
+    i = 0
+    while i < array_len(gl) is
+        r = array_push(r, mk(3, "procs", "Moduł z /proc/modules bez wpisu w /sys/module", gl[i], "Niespójność widoków jądra - możliwa manipulacja."))
+        i += 1
+    end
+
+    let taint: int = to_int(sh("cat /proc/sys/kernel/tainted 2>/dev/null"))
+    if taint > 0 is
+        let oot: bool = yes("[ $(( " + to_string(taint) + " & 4096 )) -ne 0 ] || [ $(( " + to_string(taint) + " & 8192 )) -ne 0 ]")
+        if oot is
+            r = array_push(r, mk(1, "procs", "Jądro oznaczone jako tainted (moduł spoza drzewa / niepodpisany)", "tainted=" + to_string(taint), "Sprawdź dmesg | grep -i taint oraz listę modułów (lsmod)."))
+        end
+    end
+    return r
+end
+
+;; ── module: net ───────────────────────────────────────────────────────────────
+
+fn mod_net(root: bool) -> [string] is
+    let mut r: [string] = []
+    let pr: string = sh("for f in /sys/class/net/*/flags; do n=$(basename $(dirname $f)); case \"$n\" in lo|docker*|br-*|veth*|virbr*|cni*|flannel*|cali*|tun*|tap*) continue;; esac; v=$(cat $f 2>/dev/null); [ -n \"$v\" ] && [ $(( v & 256 )) -ne 0 ] && echo \"$n\"; done")
+    let pl: [string] = lines_of(pr)
+    let mut i: int = 0
+    while i < array_len(pl) is
+        r = array_push(r, mk(2, "net", "Interfejs w trybie promiscuous", pl[i], "Sniffer? ip -d link show " + pl[i] + "; sprawdź /proc/net/packet."))
+        i += 1
+    end
+    if root && have_cmd_q("ss") is
+        let ls: string = sh("ss -H -tulnp 2>/dev/null | grep -v 'users:' | awk '{print $1\" \"$5}' | head -10")
+        let ll: [string] = lines_of(ls)
+        i = 0
+        while i < array_len(ll) is
+            r = array_push(r, mk(3, "net", "Port nasłuchuje bez widocznego procesu", ll[i], "Gniazdo bez właściciela w ss -p = proces ukryty lub podmienione ss. Porównaj z /proc/net/tcp."))
+            i += 1
+        end
+    end
+    let raw: int = to_int(sh("tail -n +2 /proc/net/raw 2>/dev/null | wc -l"))
+    if raw > 0 is
+        r = array_push(r, mk(1, "net", "Otwarte gniazda RAW: " + to_string(raw), "/proc/net/raw", "Ping/traceroute je tworzą, ale także skanery i backdoory ICMP."))
+    end
+    return r
+end
+
+;; ── module: baseline ─────────────────────────────────────────────────────────
+;; Migawka logów (inode|rozmiar|mtime) i porównanie później: skrócenie = czyszczenie.
+
+fn watch_list(logdir: string) -> [string] is
+    let mut w: [string] = []
+    let core: [string] = ["auth.log", "secure", "syslog", "messages", "kern.log", "audit/audit.log", "wtmp", "btmp", "lastlog", "faillog"]
+    let mut i: int = 0
+    while i < array_len(core) is
+        let p: string = logdir + "/" + core[i]
+        if fs_exists(p) is
+            w = array_push(w, p)
+        end
+        i += 1
+    end
+    let extra: string = sh("ls " + shquote(logdir) + "/*.log 2>/dev/null")
+    let el: [string] = lines_of(extra)
+    i = 0
+    while i < array_len(el) is
+        if !array_contains(w, el[i]) is
+            w = array_push(w, el[i])
+        end
+        i += 1
+    end
+    return w
+end
+
+fn baseline_path(state: string) -> string is
+    return state + "/baseline.txt"
+end
+
+fn baseline_save(logdir: string, state: string) -> int is
+    let w: [string] = watch_list(logdir)
+    let mut body: string = ""
+    let mut i: int = 0
+    while i < array_len(w) is
+        let p: string = w[i]
+        body = body + p + "|" + file_inode(p) + "|" + to_string(file_size(p)) + "|" + to_string(file_mtime(p)) + "\n"
+        i += 1
+    end
+    fs_mkdir_all(state)
+    fs_write(baseline_path(state), body)
+    return array_len(w)
+end
+
+fn mod_baseline(state: string) -> [string] is
+    let mut r: [string] = []
+    let bp: string = baseline_path(state)
+    if !fs_exists(bp) is
+        r = array_push(r, mk(0, "baseline", "Brak baseline", bp, "Uruchom: eiq baseline save - kolejne skany wykryją skrócenie lub usunięcie logów."))
+        return r
+    end
+    let rows: [string] = lines_of(fs_read(bp))
+    let mut i: int = 0
+    while i < array_len(rows) is
+        let f: [string] = split(rows[i], "|")
+        if array_len(f) >= 4 is
+            let p: string = f[0]
+            let old_ino: string = f[1]
+            let old_size: int = to_int(f[2])
+            let old_mtime: int = to_int(f[3])
+            if !fs_exists(p) is
+                r = array_push(r, mk(3, "baseline", "Log usunięty od czasu baseline", p, "Był: " + to_string(old_size) + " B. Sprawdź czy to rotacja (ls " + p + ".1)."))
+            else is
+                let ino: string = file_inode(p)
+                let size: int = file_size(p)
+                let mtime: int = file_mtime(p)
+                if ino == old_ino is
+                    if size < old_size is
+                        r = array_push(r, mk(3, "baseline", "Log SKRÓCONY (to samo inode): " + to_string(old_size) + " -> " + to_string(size) + " B", p, "Plik skrócono w miejscu (truncate / > plik) - klasyczne czyszczenie śladów."))
+                    end
+                    if mtime < old_mtime is
+                        r = array_push(r, mk(2, "baseline", "Data modyfikacji cofnięta (timestomp)", p, "mtime jest starsze niż w baseline mimo tego samego pliku."))
+                    end
+                else is
+                    let arch: string = sh("ls " + shquote(p) + ".1 " + shquote(p) + ".0 " + shquote(p) + "-* " + shquote(p) + ".1.gz 2>/dev/null | head -1")
+                    if arch == "" is
+                        r = array_push(r, mk(2, "baseline", "Log podmieniony (inode zmienione), brak śladu rotacji", p, "Nowy plik bez archiwum .1/.gz - ktoś usunął i odtworzył log."))
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+    return r
+end
+
+;; ── orchestration ────────────────────────────────────────────────────────────
+
+fn all_modules() -> [string] is
+    return ["logs", "audit", "history", "services", "procs", "net", "baseline"]
+end
+
+fn module_desc(m: string) -> string is
+    if m == "logs" is
+        return "puste, zamrożone, przekierowane, usunięte logi i luki w nich"
+    end
+    if m == "audit" is
+        return "auditd, rsyslog, journald, sshd LogLevel, crony kasujące logi"
+    end
+    if m == "history" is
+        return "historia powłoki: /dev/null, chattr +i, HISTFILE w profilach"
+    end
+    if m == "services" is
+        return "narzędzia bezpieczeństwa zainstalowane, ale zatrzymane"
+    end
+    if m == "procs" is
+        return "ukryte procesy, fileless, usunięte binarki, ukryte moduły jądra"
+    end
+    if m == "net" is
+        return "promiscuous, nasłuch bez procesu, gniazda RAW"
+    end
+    if m == "baseline" is
+        return "porównanie logów z zapisaną migawką (skrócenie, podmiana)"
+    end
+    return ""
+end
+
+fn run_module(m: string, logdir: string, state: string, root: bool, gap_h: int, deep: bool) -> [string] is
+    let mut none: [string] = []
+    if m == "logs" is
+        return mod_logs(logdir, gap_h)
+    end
+    if m == "audit" is
+        return mod_audit(root)
+    end
+    if m == "history" is
+        return mod_history()
+    end
+    if m == "services" is
+        return mod_services()
+    end
+    if m == "procs" is
+        return mod_procs(deep)
+    end
+    if m == "net" is
+        return mod_net(root)
+    end
+    if m == "baseline" is
+        return mod_baseline(state)
+    end
+    return none
+end
+
+fn print_finding(f: string) is
+    let sev: int = sev_of(f)
+    write("  " + sev_tag(sev) + "  " + field(f, 2))
+    let d: string = field(f, 3)
+    if d != "" is
+        write(dim_text("        " + shorten(d, 220)))
+    end
+    let h: string = field(f, 4)
+    if h != "" is
+        write(dim_text("        -> " + shorten(h, 220)))
     end
 end
 
-fn remove_debian_kernel(prefix: string) is
-    let script: string = "/usr/share/HackerOS/Scripts/Bin/remove-debian-kernel.sh"
-    let exists: string = trim(shell("test -f " + script + " && echo yes || echo no"))
-    if exists == "yes" is
-        write(prefix + " Uruchamiam skrypt usuwajacy stare jadra: " + script)
-        sudo_run(script)
+fn verdict(score: int, crit: int) -> string is
+    if crit > 0 || score >= 60 is
+        return "PODEJRZANIE CICHO - silne oznaki zacierania śladów"
+    end
+    if score >= 25 is
+        return "NIEPOKOJĄCA CISZA - wymaga przeglądu"
+    end
+    if score > 0 is
+        return "DROBNE ODCHYLENIA - do sprawdzenia"
+    end
+    return "CISZA JEST NORMALNA - brak oznak ingerencji"
+end
+
+fn usage() is
+    banner("eiq", "1.0.0", "Everywhere Is Quiet — detektor podejrzanej ciszy")
+    write("  eiq [scan] [--module=a,b] [--json] [--fail-on=high] [--gap=6] [--deep]")
+    write("                         przeskanuj hosta pod kątem zacierania śladów")
+    write("  eiq baseline save      zapisz migawkę logów (inode, rozmiar, mtime)")
+    write("  eiq baseline check     porównaj logi z migawką")
+    write("  eiq modules            lista modułów")
+    write("")
+    write("  --module=LISTA   logs,audit,history,services,procs,net,baseline (domyślnie: wszystkie)")
+    write("  --json           wynik w JSON (bez banera)")
+    write("  --fail-on=POZIOM crit|high|med|low  - kod wyjścia 1 gdy znaleziono >= poziom (domyślnie high)")
+    write("  --gap=GODZ       próg luki w syslog w godzinach (domyślnie 6)")
+    write("  --deep           pełne skanowanie PID do pid_max (wolniejsze)")
+    write("  --logdir=DIR     katalog logów (domyślnie /var/log)")
+    write("  --state=DIR      katalog baseline (domyślnie ~/.hackeros/eiq)")
+    write("")
+    write("  Kody wyjścia: 0 czysto, 1 znaleziska >= --fail-on, 2 błąd użycia.")
+    write("  Wiele testów wymaga root (auditctl, ss -p, journalctl).")
+    write("  Test: EIQ_UPTIME=<sekundy> nadpisuje uptime (symulacja długo działającego hosta).")
+end
+
+fn scan(args: [string]) -> int is
+    let json: bool = arg_has(args, "--json")
+    let logdir: string = arg_val(args, "--logdir", "/var/log")
+    let state: string = arg_val(args, "--state", home_dir() + "/.hackeros/eiq")
+    let gap_h: int = to_int(arg_val(args, "--gap", "6"))
+    let deep: bool = arg_has(args, "--deep")
+    let fail_on: int = sev_from_name(arg_val(args, "--fail-on", "high"))
+    if fail_on < 0 is
+        write("eiq: nieznany poziom --fail-on (crit|high|med|low)")
+        return 2
+    end
+    let root: bool = is_root()
+
+    let mut mods: [string] = all_modules()
+    let sel: string = arg_val(args, "--module", "")
+    if sel != "" is
+        let chosen: [string] = split(sel, ",")
+        let known: [string] = all_modules()
+        let mut j: int = 0
+        while j < array_len(chosen) is
+            if !array_contains(known, chosen[j]) is
+                write("eiq: nieznany moduł: " + chosen[j] + "  (eiq modules)")
+                return 2
+            end
+            j += 1
+        end
+        mods = chosen
+    end
+
+    if !json is
+        banner("eiq", "1.0.0", "Everywhere Is Quiet — detektor podejrzanej ciszy")
+        let host: string = sh("hostname 2>/dev/null")
+        let kern: string = sh("uname -sr 2>/dev/null")
+        let upt: string = sh("uptime -p 2>/dev/null")
+        write(dim_text("  host: " + host + "   kernel: " + kern + "   " + upt))
+        if root is
+            write(dim_text("  uprawnienia: root (pełny zakres testów)"))
+        else is
+            write(yellow_text("  uprawnienia: zwykły użytkownik - część testów (auditctl, ss -p, journalctl) pominięta"))
+        end
+        if in_container() is
+            write(dim_text("  wykryto kontener - niektóre testy logów są wyciszone"))
+        end
+        write("")
+    end
+
+    let mut all: [string] = []
+    let mut i: int = 0
+    while i < array_len(mods) is
+        let m: string = mods[i]
+        let res: [string] = run_module(m, logdir, state, root, gap_h, deep)
+        if !json is
+            write(bold("  ▸ " + m) + dim_text("   " + module_desc(m)))
+            if array_len(res) == 0 is
+                write("  " + green_text("PASS") + "  brak oznak ingerencji")
+            end
+            let mut sv: int = 4
+            while sv >= 0 is
+                let mut k: int = 0
+                while k < array_len(res) is
+                    if sev_of(res[k]) == sv is
+                        print_finding(res[k])
+                    end
+                    k += 1
+                end
+                sv -= 1
+            end
+            write("")
+        end
+        let mut k2: int = 0
+        while k2 < array_len(res) is
+            all = array_push(all, res[k2])
+            k2 += 1
+        end
+        i += 1
+    end
+
+    let mut score: int = 0
+    let mut counts: [int] = [0, 0, 0, 0, 0]
+    let mut worst: int = -1
+    i = 0
+    while i < array_len(all) is
+        let s: int = sev_of(all[i])
+        score += sev_weight(s)
+        counts[s] = counts[s] + 1
+        if s > worst is
+            worst = s
+        end
+        i += 1
+    end
+    if score > 100 is
+        score = 100
+    end
+
+    if json is
+        let mut items: string = ""
+        i = 0
+        while i < array_len(all) is
+            let f: string = all[i]
+            if i > 0 is
+                items = items + ",\n    "
+            end
+            items = items + "{\"severity\":\"" + sev_name(sev_of(f)) + "\",\"module\":\"" + jesc(field(f, 1)) + "\",\"title\":\"" + jesc(field(f, 2)) + "\",\"detail\":\"" + jesc(field(f, 3)) + "\",\"hint\":\"" + jesc(field(f, 4)) + "\"}"
+            i += 1
+        end
+        write("{")
+        write("  \"tool\": \"eiq\",")
+        write("  \"version\": \"1.0.0\",")
+        write("  \"root\": " + to_string(root) + ",")
+        write("  \"findings\": " + to_string(array_len(all)) + ",")
+        write("  \"risk\": " + to_string(score) + ",")
+        write("  \"verdict\": \"" + jesc(verdict(score, counts[4])) + "\",")
+        write("  \"counts\": {\"crit\":" + to_string(counts[4]) + ",\"high\":" + to_string(counts[3]) + ",\"med\":" + to_string(counts[2]) + ",\"low\":" + to_string(counts[1]) + ",\"info\":" + to_string(counts[0]) + "},")
+        write("  \"results\": [")
+        if items != "" is
+            write("    " + items)
+        end
+        write("  ]")
+        write("}")
     else is
-        write(prefix + " Skrypt nie istnieje: " + script + " - usuwam biezace jadro.")
-        let uname: string = get_current_kernel()
-        sudo_run("apt remove --purge -y linux-image-" + uname)
+        write(dim_text("  " + string_repeat("─", 58)))
+        write("  znaleziska: " + red_text(to_string(counts[4]) + " crit") + "  " + red_text(to_string(counts[3]) + " high") + "  " + yellow_text(to_string(counts[2]) + " med") + "  " + cyan_text(to_string(counts[1]) + " low") + "  " + dim_text(to_string(counts[0]) + " info"))
+        let line: string = "ryzyko: " + to_string(score) + "/100   " + verdict(score, counts[4])
+        if counts[4] > 0 || score >= 60 is
+            write("  " + red_text(line))
+        elsif score >= 25 is
+            write("  " + yellow_text(line))
+        else is
+            write("  " + green_text(line))
+        end
+        write("")
     end
+
+    if worst >= fail_on && worst > 0 is
+        return 1
+    end
+    return 0
 end
 
-fn create_config_file(kernel_type: string) is
-    let home: string       = get_home()
-    let config_dir: string = home + "/.config/hackeros"
-    shell("mkdir -p " + config_dir)
-    fs_write(config_dir + "/kernel.hacker", "[" + kernel_type + "]\n")
-end
-
-fn add_xanmod_repo(prefix: string) is
-    write(prefix + " Dodaje repozytorium xanmod...")
-    sudo_run("mkdir -p /etc/apt/keyrings")
-    if command_exists("wget") == false is
-        sudo_run("apt update")
-        sudo_run("apt install -y wget")
+fn cmd_baseline(args: [string]) -> int is
+    let sub: string = positional(args, 2)
+    let logdir: string = arg_val(args, "--logdir", "/var/log")
+    let state: string = arg_val(args, "--state", home_dir() + "/.hackeros/eiq")
+    if sub == "save" is
+        let n: int = baseline_save(logdir, state)
+        banner("eiq", "1.0.0", "baseline")
+        write("  " + green_text("OK") + "  zapisano migawkę " + to_string(n) + " logów -> " + baseline_path(state))
+        return 0
     end
-    shell("wget -qO /tmp/xanmod.key https://dl.xanmod.org/archive.key")
-    sudo_run("gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg /tmp/xanmod.key")
-    let release: string = trim(shell("lsb_release -sc 2>/dev/null || echo bookworm"))
-    let list_content: string = "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org " + release + " main"
-    fs_write("/tmp/xanmod-release.list", list_content)
-    sudo_run("cp /tmp/xanmod-release.list /etc/apt/sources.list.d/xanmod-release.list")
-    sudo_run("apt update")
-end
-
-fn install_xanmod() is
-    let prefix: string = "[xanmod-installer]"
-    write(prefix + " Start")
-    let tmpfile: string    = "/tmp/xanmod-cpu.hacker"
-    let github_raw: string = "https://raw.githubusercontent.com/HackerOS-Linux-System/Hacker-Lang/main/hacker-packages/xanmod-cpu.hacker"
-    write(prefix + " Pobieram plik z GitHub: " + github_raw)
-    if command_exists("curl") == false is
-        sudo_run("apt update")
-        sudo_run("apt install -y curl")
+    if sub == "check" is
+        let res: [string] = mod_baseline(state)
+        banner("eiq", "1.0.0", "baseline check")
+        if array_len(res) == 0 is
+            write("  " + green_text("PASS") + "  logi zgodne z migawką (brak skrócenia/usunięcia)")
+            return 0
+        end
+        let mut worst: int = 0
+        let mut i: int = 0
+        while i < array_len(res) is
+            print_finding(res[i])
+            if sev_of(res[i]) > worst is
+                worst = sev_of(res[i])
+            end
+            i += 1
+        end
+        if worst >= 3 is
+            return 1
+        end
+        return 0
     end
-    let dl: string = trim(shell("curl -fsSL -o " + tmpfile + " " + github_raw + " 2>&1 && echo ok || echo fail"))
-    if dl != "ok" is
-        write(prefix + " Blad pobierania pliku z GitHub.")
-        return
-    end
-    write(prefix + " Plik pobrany.")
-    let mappings: string       = parse_mappings(tmpfile)
-    let cpu_text: string       = get_cpu_text()
-    write(prefix + " Wykryty CPU: " + get_cpu_model())
-    let selected_target: string = match_cpu_variant(cpu_text, mappings)
-    write(prefix + " Dopasowano target: " + selected_target)
-    let variant: string = get_xanmod_variant(selected_target)
-    write(prefix + " Wybrana wersja xanmod: " + variant)
-    add_xanmod_repo(prefix)
-    let pkg: string = "linux-xanmod-lts-" + variant
-    write(prefix + " Instaluje: " + pkg)
-    sudo_run("apt install -y " + pkg)
-    write(prefix + " Instalacja kernela xanmod zakonczona.")
-    check_and_install_nvidia(prefix)
-    remove_debian_kernel(prefix)
-    create_config_file("xanmod")
-    sudo_run("update-grub")
-    write(prefix + " GOTOWE. Zrestartuj system.")
-end
-
-fn install_liquorix() is
-    let prefix: string = "[liquorix-installer]"
-    write(prefix + " Start")
-    let tmpfile: string    = "/tmp/xanmod-cpu.hacker"
-    let github_raw: string = "https://raw.githubusercontent.com/HackerOS-Linux-System/Hacker-Lang/main/hacker-packages/xanmod-cpu.hacker"
-    if command_exists("curl") == false is
-        sudo_run("apt update")
-        sudo_run("apt install -y curl")
-    end
-    let dl: string = trim(shell("curl -fsSL -o " + tmpfile + " " + github_raw + " 2>&1 && echo ok || echo fail"))
-    if dl != "ok" is
-        write(prefix + " Blad pobierania pliku z GitHub.")
-        return
-    end
-    write(prefix + " Plik pobrany.")
-    let mappings: string        = parse_mappings(tmpfile)
-    let cpu_text: string        = get_cpu_text()
-    write(prefix + " Wykryty CPU: " + get_cpu_model())
-    let selected_target: string = match_cpu_variant(cpu_text, mappings)
-    write(prefix + " Dopasowano target: " + selected_target)
-    write(prefix + " Instaluje jadro Liquorix...")
-    let liquorix_url: string = "https://liquorix.net/install-liquorix.sh"
-    shell("curl -s " + liquorix_url + " -o /tmp/install-liquorix.sh")
-    sudo_run("bash /tmp/install-liquorix.sh")
-    write(prefix + " Jadro Liquorix zainstalowane.")
-    check_and_install_nvidia(prefix)
-    remove_debian_kernel(prefix)
-    create_config_file("liquorix")
-    write(prefix + " GOTOWE. Zrestartuj system.")
-end
-
-fn install_deb_kernel() is
-    let prefix: string  = "[deb-kernel-installer]"
-    let current: string = get_current_kernel()
-    let has_liquorix: bool = contains(current, "liquorix")
-    let has_xanmod: bool   = contains(current, "xanmod")
-    if has_liquorix == false && has_xanmod == false is
-        write(prefix + " Jadro Debiana jest juz aktywne. Nic nie robie.")
-        return
-    end
-    write(prefix + " Usuwam aktualne jadro i instaluje debianowe.")
-    sudo_run("apt remove --purge -y linux-image-" + current)
-    sudo_run("apt update")
-    sudo_run("apt install -y linux-image-amd64")
-    sudo_run("update-grub")
-    let home: string        = get_home()
-    let config_file: string = home + "/.config/hackeros/kernel.hacker"
-    shell("rm -f " + config_file)
-    write(prefix + " GOTOWE. Zrestartuj system.")
-end
-
-fn get_argv1() -> string is
-    ;; Read first CLI argument via shell — works in interpreter and compiled mode
-    return trim(shell("echo ${CHKER_CMD:-}"))
+    write("eiq: użycie: eiq baseline save|check")
+    return 2
 end
 
 fn main() is
-    ;; In H# v0.7 we use env var CHKER_CMD to pass command
-    ;; Usage: CHKER_CMD=liquorix ./chker
-    ;; Or via wrapper script that sets CHKER_CMD from $1
-    let cmd: string = get_argv1()
-    if cmd == "" is
-        print_help()
+    let args: [string] = env_args()
+    let cmd: string = positional(args, 1)
+    if arg_has(args, "--help") || arg_has(args, "-h") || cmd == "help" is
+        usage()
         return
     end
-    if cmd == "liquorix" is
-        install_liquorix()
-    elsif cmd == "xanmod" is
-        install_xanmod()
-    elsif cmd == "deb-kernel" is
-        install_deb_kernel()
-    else is
-        write("Nieznane polecenie: " + cmd)
-        print_help()
+    if cmd == "modules" is
+        banner("eiq", "1.0.0", "moduły")
+        let ms: [string] = all_modules()
+        let mut i: int = 0
+        while i < array_len(ms) is
+            write("  " + cyan_text(string_pad_right(ms[i], 10)) + module_desc(ms[i]))
+            i += 1
+        end
+        return
     end
+    if cmd == "baseline" is
+        exit(cmd_baseline(args))
+    end
+    if cmd == "" || cmd == "scan" is
+        exit(scan(args))
+    end
+    write("eiq: nieznane polecenie: " + cmd)
+    usage()
+    exit(2)
 end
